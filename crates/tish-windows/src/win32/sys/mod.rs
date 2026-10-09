@@ -7,7 +7,14 @@
 //! - `windows.credentials`: `get(account)`, `set(account, secret)`, `delete(account)`, `has(account)`
 //! - `windows.hotkeys`: `register(spec, cb)`, `unregister(id)`, `check(spec)`, `display(spec)`
 //! - `windows.statusItem(options)`: a notification-area (tray) icon with a menu
-//! - `windows.apps.installed()`: Start menu shortcuts
+//! - `windows.apps`: `installed()` (Start menu), `running()`, `act(pid, action)`, `quitAll()`,
+//!   `hideAll()`
+//! - `windows.system`: lock, sleep, displays off, screen saver, restart, shut down, log out,
+//!   Recycle Bin, dark mode, volume and mute, eject
+//! - `windows.timeZones`: `names()`, `local()`, `at(id, unix)`, `byAbbreviation(abbr)`
+//! - `windows.systemInfo()`, `windows.screens()`
+//! - `windows.accessibility`: `trusted()`, `selectedText()`, `replaceBeforeCursor(typed, text)`,
+//!   `focusedWindow()`, `setFocusedWindowFrame(x, y, w, h)`, `windowAction(pid, action)`
 //! - `windows.icons`: `file(path)` (the shell's icon), `image(path)` (an image file),
 //!   `symbol(name)` ("" for now), `onLoaded(cb)`: names to use as an `<image src>`
 //!
@@ -15,11 +22,15 @@
 //! posted message, like `whenSettled`. The services have their own hidden window, made on first
 //! use, so hotkeys, the tray icon and the clipboard watcher work before `windows.run` too.
 
+mod accessibility;
 mod apps;
 mod credentials;
 mod hotkeys;
 mod pasteboard;
 mod shell;
+mod sysinfo;
+mod system;
+mod timezones;
 mod tray;
 mod workspace;
 
@@ -269,7 +280,52 @@ pub(super) fn install(w: &mut ObjectMap) {
     );
     w.insert(Arc::from("hotkeys"), namespace(vec![("register", hotkeys::register), ("unregister", hotkeys::unregister), ("check", hotkeys::check), ("display", hotkeys::display)]));
     w.insert(Arc::from("statusItem"), Value::native(tray::status_item));
-    w.insert(Arc::from("apps"), namespace(vec![("installed", apps::installed)]));
+    w.insert(
+        Arc::from("apps"),
+        namespace(vec![
+            ("installed", apps::installed),
+            ("running", system::running),
+            ("act", system::act),
+            ("quitAll", system::quit_all),
+            ("hideAll", system::hide_all),
+        ]),
+    );
+    w.insert(
+        Arc::from("system"),
+        namespace(vec![
+            ("lockScreen", system::lock),
+            ("sleep", system::sleep),
+            ("sleepDisplays", system::sleep_displays),
+            ("screenSaver", system::screen_saver),
+            ("restart", system::restart),
+            ("shutDown", system::shut_down),
+            ("logOut", system::log_out),
+            ("emptyTrash", system::empty_trash),
+            ("darkMode", system::dark_mode),
+            ("setDarkMode", system::set_dark_mode),
+            ("volume", system::volume),
+            ("setVolume", system::set_volume),
+            ("setMuted", system::set_muted),
+            ("ejectAll", system::eject_all),
+        ]),
+    );
+    w.insert(
+        Arc::from("timeZones"),
+        namespace(vec![("names", timezones::names), ("local", timezones::local), ("at", timezones::at), ("byAbbreviation", timezones::by_abbreviation)]),
+    );
+    w.insert(Arc::from("systemInfo"), Value::native(sysinfo::system_info));
+    w.insert(
+        Arc::from("accessibility"),
+        namespace(vec![
+            ("trusted", accessibility::trusted),
+            ("selectedText", accessibility::selected_text),
+            ("replaceBeforeCursor", accessibility::replace_before_cursor),
+            ("focusedWindow", accessibility::focused_window),
+            ("setFocusedWindowFrame", accessibility::set_focused_window_frame),
+            ("windowAction", accessibility::window_action),
+        ]),
+    );
+    w.insert(Arc::from("screens"), Value::native(accessibility::screens));
     w.insert(
         Arc::from("icons"),
         namespace(vec![("file", icon_file), ("image", icon_image), ("symbol", icon_symbol), ("onLoaded", icon_on_loaded)]),

@@ -26,6 +26,20 @@ thread_local! {
     /// Set while this app writes, so its own copies report `app: ""`.
     static OWN_WRITE: Cell<bool> = const { Cell::new(false) };
     static LISTENING: Cell<bool> = const { Cell::new(false) };
+    /// Clipboard updates to ignore: a selection read through Ctrl+C and its restore.
+    static SUPPRESS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The clipboard's text (for the selection read; not reported to the watcher).
+pub(super) fn read_raw() -> String {
+    read()
+}
+
+/// Put `text` back (after reading a selection through Ctrl+C); the watcher skips both changes.
+pub(super) fn write_raw(text: &str) {
+    SUPPRESS.with(|s| s.set(s.get() + 2));
+    write_text(&[Value::String(text.into())]);
+    OWN_WRITE.with(|o| o.set(false));
 }
 
 /// Open the clipboard, retrying briefly: another app may hold it for a moment.
@@ -142,6 +156,13 @@ fn foreground_app() -> (String, String) {
 pub(super) fn handle(msg: u32, _wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
     if msg != WM_CLIPBOARDUPDATE {
         return None;
+    }
+    if SUPPRESS.with(|s| {
+        let n = s.get();
+        s.set(n.saturating_sub(1));
+        n > 0
+    }) {
+        return Some(LRESULT(0));
     }
     let own = OWN_WRITE.with(|o| o.replace(false));
     let Some(cb) = WATCHER.with(|w| w.borrow().clone()) else { return Some(LRESULT(0)) };
