@@ -102,3 +102,4 @@ jobs:
             stderr.txt
             status.txt
             after.txt
+            after.png
