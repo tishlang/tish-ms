@@ -1,0 +1,11 @@
+[package]
+name = "tishlang_ms_common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared vnode tree, layout and style helpers for the Windows Tish UI hosts"
+license = "MIT"
+repository = "https://github.com/tishlang/tish-ms"
+
+[dependencies]
+tishlang_core = "4.0.1"
+tishlang_ui = { version = "4.0.1", default-features = false, features = ["runtime"] }

@@ -1,0 +1,11 @@
+{
+  "name": "tish-windows",
+  "version": "0.1.0",
+  "description": "Win32 native UI host and system services for Tish JSX (Windows)",
+  "license": "MIT",
+  "tish": {
+    "module": true,
+    "crate": "tishlang_windows",
+    "export": "windows_object"
+  }
+}

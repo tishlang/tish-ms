@@ -1,0 +1,31 @@
+# Layout tests and a Windows type-check, on Linux (cheap). Windows itself runs only in bench.yml,
+# started by hand.
+name: CI
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Test and check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Shared layout tests
+        run: cargo test -p tishlang_ms_common
+      - name: Off-Windows stubs build
+        run: cargo check -p tishlang_windows --no-default-features
+      - name: Windows type-check (cargo-xwin)
+        run: |
+          sudo apt-get install -y clang lld llvm >/dev/null
+          cargo install cargo-xwin --locked
+          XWIN_ACCEPT_LICENSE=1 cargo xwin check --target x86_64-pc-windows-msvc -p tishlang_windows

@@ -1,0 +1,97 @@
+// A launcher-shaped proof of concept for the Windows hosts: a borderless panel with a search
+// field and a filtered list, driven like Moo. TISH_BENCH=1 types a query one key at a time,
+// prints the host's timings as JSON and quits.
+
+import { windows, useState } from 'tish:windows'
+import { env } from 'tish:process'
+
+let WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet']
+let ITEMS = []
+for (let i = 0; i < 1000; i = i + 1) {
+  ITEMS.push(WORDS[i % 10] + ' ' + WORDS[Math.floor(i / 10) % 10] + ' ' + i)
+}
+let ROWS = 9
+let ROW_H = 40
+let BENCH = env.TISH_BENCH === '1'
+let BENCH_QUERY = 'echo golf 4'
+
+let setQueryOut = null
+let setSelOut = null
+let selNow = 0
+let shown = 0
+
+fn matches(q) {
+  if (q === '') {
+    return ITEMS
+  }
+  return ITEMS.filter((s) => s.indexOf(q) >= 0)
+}
+
+fn Row(props) {
+  let bg = props.selected ? '#3a6ff730' : 'transparent'
+  return (
+    <row columnWidths={[44, 'flex']} alignItems="center" height={ROW_H} paddingLeft={12} backgroundColor={bg} borderRadius={8}
+    ><image src="app" height={24} /><text fontSize={15}>{props.label}</text></row>
+  )
+}
+
+fn App() {
+  let [query, setQuery] = useState('')
+  let [sel, setSel] = useState(0)
+  setQueryOut = setQuery
+  setSelOut = setSel
+  selNow = sel
+  let found = matches(query)
+  shown = found.length
+  let rows = []
+  for (let i = 0; i < ROWS && i < found.length; i = i + 1) {
+    rows.push(<Row label={found[i]} selected={i === sel} />)
+  }
+  return (
+    <div padding={10}>
+      <row columnWidths={[36, 'flex']} alignItems="center" height={52}
+      ><image src="search" height={20} /><textinput value={query} placeholder="Search" fontSize={20} onChange={(v) => {
+        setQuery(v)
+        setSel(0)
+      }} /></row>
+      <rule />
+      <div paddingTop={6}>{rows}</div>
+      <text fontSize={12} color="#9a9a9a">{found.length + ' results'}</text>
+    </div>
+  )
+}
+
+fn onKey(name) {
+  if (name === 'down') {
+    setSelOut(Math.min(selNow + 1, Math.min(ROWS, shown) - 1))
+    return true
+  }
+  if (name === 'up') {
+    setSelOut(Math.max(selNow - 1, 0))
+    return true
+  }
+  if (name === 'escape') {
+    windows.quit()
+    return true
+  }
+  return false
+}
+
+fn bench() {
+  let times = []
+  for (let i = 1; i <= BENCH_QUERY.length; i = i + 1) {
+    let t0 = Date.now()
+    setQueryOut(BENCH_QUERY.slice(0, i))
+    windows.pump()
+    let st = windows.stats()
+    times.push({ key: i, totalMs: Date.now() - t0, commitMs: st.lastCommitMs, paintMs: st.lastPaintMs })
+  }
+  let st = windows.stats()
+  console.log(JSON.stringify({ stats: st, keystrokes: times, results: shown }))
+  windows.quit()
+}
+
+if (BENCH) {
+  setTimeout(bench, 500)
+}
+windows.run(App, { title: 'Launcher POC', width: 750, height: 520, borderless: true, backdrop: 'acrylic', onKey: onKey })

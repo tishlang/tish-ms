@@ -1,0 +1,54 @@
+# Measure the Win32 and WinUI 3 hosts on real Windows. Started by hand only (Windows minutes are
+# costly). The binary is built beforehand (scripts/package-poc.sh) and attached to a release; this
+# job installs the Windows App SDK runtime, runs each host three times in bench mode and reports.
+name: Bench hosts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release holding launcher-poc.zip (from scripts/package-poc.sh)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p launcher-poc.zip
+          Expand-Archive launcher-poc.zip -DestinationPath poc
+      - name: Windows App SDK 2.5 runtime (for the WinUI host)
+        run: |
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.windowsappsdk.runtime/2.5.1/microsoft.windowsappsdk.runtime.2.5.1.nupkg -OutFile rt.zip
+          Expand-Archive rt.zip -DestinationPath rt
+          $m = "rt/tools/MSIX/win10-x64"
+          Add-AppxPackage "$m/Microsoft.WindowsAppRuntime.2.msix"
+          Add-AppxPackage "$m/Microsoft.WindowsAppRuntime.Main.2.msix"
+          Add-AppxPackage "$m/Microsoft.WindowsAppRuntime.Singleton.2.msix"
+          Add-AppxPackage "$m/Microsoft.WindowsAppRuntime.DDLM.2.msix"
+      - name: Run both hosts
+        working-directory: poc
+        run: |
+          $env:TISH_BENCH = "1"
+          $results = @()
+          foreach ($run in 1..3) {
+            foreach ($hostName in @("win32", "winui")) {
+              $env:TISH_WINDOWS_HOST = $hostName
+              $out = & .\launcher-poc.exe 2>&1 | Out-String
+              Write-Host "== $hostName run $run"; Write-Host $out
+              $results += "$hostName $run $out"
+            }
+          }
+          $results | Out-File ../results.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results.txt
