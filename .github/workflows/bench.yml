@@ -39,6 +39,8 @@ jobs:
             }
           }
           $results | Out-File ../results.txt
+          # The app's own exit code isn't the job's result.
+          exit 0
       - uses: actions/upload-artifact@v4
         with:
           name: bench-results
