@@ -1,0 +1,55 @@
+# Publish @tishlang/tish-windows to npm when a GitHub release is promoted from prerelease to full
+# release (or by hand with a tag). The tarball is the crate's sources with its tishlang_ms_common
+# path dependency rewritten to the crates.io version, so it waits for crates-release.yml to
+# have published that.
+#
+# AUTH: npm OIDC trusted publishing (no NPM_TOKEN). A trusted publisher can only be set up for a
+# package that exists, so the FIRST publish is by hand (docs/RELEASE.md); this workflow skips
+# versions already on npm. Then on npmjs.com, @tishlang/tish-windows → Settings → Trusted
+# Publisher → GitHub Actions: organization tishlang, repository tish-ms, workflow
+# npm-release.yml, environment blank.
+
+name: NPM release
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)publish, e.g. v1.0.0"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: npm with trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Wait for tishlang_ms_common on crates.io
+        run: |
+          VERSION="${TAG#v}"
+          for i in $(seq 1 60); do
+            curl -sf -A "tish-ms-release (https://github.com/tishlang/tish-ms)" "https://crates.io/api/v1/crates/tishlang_ms_common/$VERSION" >/dev/null && exit 0
+            echo "waiting for tishlang_ms_common $VERSION ($i/60)"; sleep 15
+          done
+          echo "::error::tishlang_ms_common $VERSION isn't on crates.io; run Crates.io release for $TAG first."
+          exit 1
+
+      - name: Publish
+        run: node scripts/publish-npm.mjs --version "${TAG#v}"

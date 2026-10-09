@@ -17,6 +17,16 @@ on:
         description: "Executable inside the zip"
         required: true
         type: string
+      keys:
+        description: "Keys to type once it's up (WScript SendKeys syntax), then a second screenshot"
+        required: false
+        default: ""
+        type: string
+      env:
+        description: "Environment for the app, NAME=value;NAME2=value"
+        required: false
+        default: ""
+        type: string
       seconds:
         description: "How long to let it run before the screenshot"
         required: false
@@ -40,6 +50,7 @@ jobs:
       - name: Run, screenshot, stop
         working-directory: app
         run: |
+          foreach ($kv in "${{ inputs.env }}".Split(";")) { if ($kv -match "=") { $k, $v = $kv.Split("=", 2); [Environment]::SetEnvironmentVariable($k, $v) } }
           $p = Start-Process -FilePath ".\${{ inputs.exe }}" -PassThru -RedirectStandardOutput ..\stdout.txt -RedirectStandardError ..\stderr.txt
           Start-Sleep -Seconds ${{ inputs.seconds }}
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -48,15 +59,23 @@ jobs:
           $g = [System.Drawing.Graphics]::FromImage($bmp)
           $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
           $bmp.Save("..\screen.png")
+          if ("${{ inputs.keys }}" -ne "") {
+            $sh = New-Object -ComObject WScript.Shell
+            $sh.SendKeys("${{ inputs.keys }}")
+            Start-Sleep -Seconds 3
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("..\typed.png")
+          }
           "running: $(-not $p.HasExited)" | Out-File ..\status.txt
           if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "exit code: $($p.ExitCode)" | Out-File -Append ..\status.txt }
           Get-Content ..\status.txt, ..\stdout.txt, ..\stderr.txt -ErrorAction SilentlyContinue
           exit 0
       - uses: actions/upload-artifact@v4
         with:
-          name: try-${{ inputs.exe }}
+          name: try-${{ github.run_id }}
           path: |
             screen.png
+            typed.png
             stdout.txt
             stderr.txt
             status.txt

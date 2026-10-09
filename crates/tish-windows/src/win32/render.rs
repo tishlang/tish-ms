@@ -13,13 +13,23 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::DeleteObject;
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::core::Interface;
 
 pub struct Renderer {
     d2d: ID2D1Factory,
     dw: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     formats: RefCell<HashMap<(u32, u16), IDWriteTextFormat>>,
+    /// Decoded images by (src, pixel size), as WIC bitmaps: they outlive render targets.
+    images: RefCell<HashMap<(String, u32), Option<IWICBitmapSource>>>,
+    /// The same as Direct2D bitmaps for the current render target.
+    bitmaps: RefCell<HashMap<(String, u32), ID2D1Bitmap>>,
+    wic: Option<IWICImagingFactory>,
     pub dark: bool,
 }
 
@@ -40,7 +50,8 @@ impl Renderer {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), dark })
+            let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
+            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark })
         }
     }
 
@@ -127,6 +138,7 @@ impl Renderer {
             if let Err(e) = t.EndDraw(None, None) {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.target = None;
+                    self.bitmaps.borrow_mut().clear();
                 } else {
                     return Err(e);
                 }
@@ -161,11 +173,16 @@ impl Renderer {
                     t.FillRectangle(&rect(Rect { h: 1.0, ..f }), &b);
                 }
                 "image" if f.h > 1.0 => {
-                    // Proof of concept: a placeholder until WIC icon loading lands.
-                    let b = t.CreateSolidColorBrush(&color(Rgba { r: 0.5, g: 0.5, b: 0.5, a: 0.35 }), None)?;
                     let s = f.h.min(f.w) as f32;
                     let r = D2D_RECT_F { left: f.x as f32, top: f.y as f32, right: f.x as f32 + s, bottom: f.y as f32 + s };
-                    t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: s / 5.0, radiusY: s / 5.0 }, &b);
+                    let src = tishlang_ms_common::style::props_string(&n.props, &["src"]).unwrap_or_default();
+                    match self.bitmap(t, &src, s) {
+                        Some(bmp) => t.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                        None => {
+                            let b = t.CreateSolidColorBrush(&color(Rgba { r: 0.5, g: 0.5, b: 0.5, a: 0.35 }), None)?;
+                            t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: s / 5.0, radiusY: s / 5.0 }, &b);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -174,6 +191,65 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+}
+
+impl Renderer {
+    /// The image for `src` at about `dip` DIPs (drawn at twice that for sharp high-DPI edges):
+    /// `file:<path>` is the shell's icon for a file, folder, program or shortcut;
+    /// `image:<path>` an image file (PNG, ICO, JPEG, …). None when it can't be loaded.
+    fn bitmap(&self, t: &ID2D1HwndRenderTarget, src: &str, dip: f32) -> Option<ID2D1Bitmap> {
+        if src.is_empty() {
+            return None;
+        }
+        let px = ((dip * 2.0).ceil() as u32).clamp(16, 256);
+        let key = (src.to_string(), px);
+        if let Some(b) = self.bitmaps.borrow().get(&key) {
+            return Some(b.clone());
+        }
+        let source = {
+            let cached = self.images.borrow().get(&key).cloned();
+            match cached {
+                Some(s) => s,
+                None => {
+                    let s = self.decode(src, px);
+                    self.images.borrow_mut().insert(key.clone(), s.clone());
+                    s
+                }
+            }
+        }?;
+        let b = unsafe { t.CreateBitmapFromWicBitmap(&source, None) }.ok()?;
+        self.bitmaps.borrow_mut().insert(key, b.clone());
+        Some(b)
+    }
+
+    #[allow(clippy::question_mark)] // one branch per source kind reads clearer than `?` chains
+    fn decode(&self, src: &str, px: u32) -> Option<IWICBitmapSource> {
+        let wic = self.wic.as_ref()?;
+        let raw: IWICBitmapSource = if let Some(path) = src.strip_prefix("file:") {
+            unsafe {
+                let w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                let item: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+                let hbmp = item.GetImage(windows::Win32::Foundation::SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+                let bmp = wic.CreateBitmapFromHBITMAP(hbmp, windows::Win32::Graphics::Gdi::HPALETTE::default(), WICBitmapUsePremultipliedAlpha);
+                let _ = DeleteObject(hbmp.into());
+                bmp.ok()?.cast().ok()?
+            }
+        } else if let Some(path) = src.strip_prefix("image:") {
+            unsafe {
+                let w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                let dec = wic.CreateDecoderFromFilename(PCWSTR(w.as_ptr()), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+                dec.GetFrame(0).ok()?.cast().ok()?
+            }
+        } else {
+            return None;
+        };
+        // Direct2D wants premultiplied BGRA.
+        unsafe {
+            let conv = wic.CreateFormatConverter().ok()?;
+            conv.Initialize(&raw, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut).ok()?;
+            conv.cast().ok()
+        }
     }
 }
 
