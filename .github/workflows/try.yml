@@ -49,9 +49,11 @@ jobs:
       - name: Download
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ZIP: ${{ inputs.zip }}
         run: |
-          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "${{ inputs.zip }}"
-          Expand-Archive "${{ inputs.zip }}" -DestinationPath app
+          gh release download $env:TAG -R $env:GITHUB_REPOSITORY -p $env:ZIP
+          Expand-Archive $env:ZIP -DestinationPath app
       - name: Run, screenshot, stop
         working-directory: app
         # Inputs arrive as environment variables, never pasted into the script.
