@@ -8,6 +8,8 @@
 //! - `windows.hotkeys`: `register(spec, cb)`, `unregister(id)`, `check(spec)`, `display(spec)`
 //! - `windows.statusItem(options)`: a notification-area (tray) icon with a menu
 //! - `windows.apps.installed()`: Start menu shortcuts
+//! - `windows.icons`: `file(path)` (the shell's icon), `image(path)` (an image file),
+//!   `symbol(name)` ("" for now), `onLoaded(cb)`: names to use as an `<image src>`
 //!
 //! Callbacks always run on the UI thread. Work done elsewhere (shell commands) comes back as a
 //! posted message, like `whenSettled`. The services have their own hidden window, made on first
@@ -221,6 +223,27 @@ pub(super) fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRE
         .or_else(|| tray::handle(hwnd, msg, wp, lp))
 }
 
+/// Image names the renderer loads (and caches) when an `<image src>` is drawn.
+fn icon_file(args: &[Value]) -> Value {
+    let p = str_arg(args, 0);
+    if p.is_empty() { s("") } else { s(&format!("file:{p}")) }
+}
+
+fn icon_image(args: &[Value]) -> Value {
+    let p = str_arg(args, 0);
+    if p.is_empty() { s("") } else { s(&format!("image:{p}")) }
+}
+
+/// No symbol font mapping yet: rows show their placeholder.
+fn icon_symbol(_a: &[Value]) -> Value {
+    s("")
+}
+
+/// Icons load as they're first drawn, so there's never a later "loaded" moment.
+fn icon_on_loaded(_a: &[Value]) -> Value {
+    Value::Null
+}
+
 pub(super) fn remove_tray() {
     tray::remove();
 }
@@ -247,4 +270,8 @@ pub(super) fn install(w: &mut ObjectMap) {
     w.insert(Arc::from("hotkeys"), namespace(vec![("register", hotkeys::register), ("unregister", hotkeys::unregister), ("check", hotkeys::check), ("display", hotkeys::display)]));
     w.insert(Arc::from("statusItem"), Value::native(tray::status_item));
     w.insert(Arc::from("apps"), namespace(vec![("installed", apps::installed)]));
+    w.insert(
+        Arc::from("icons"),
+        namespace(vec![("file", icon_file), ("image", icon_image), ("symbol", icon_symbol), ("onLoaded", icon_on_loaded)]),
+    );
 }
