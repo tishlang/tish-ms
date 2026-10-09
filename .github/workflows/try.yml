@@ -85,6 +85,8 @@ jobs:
             & ([ScriptBlock]::Create($env:APP_AFTER)) *>&1 | Out-File ..\after.txt
             Pop-Location
             Copy-Item -ErrorAction SilentlyContinue after.txt ..\after.txt
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("..\after.png")
           }
           "running: $(-not $p.HasExited)" | Out-File ..\status.txt
           if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "exit code: $($p.ExitCode)" | Out-File -Append ..\status.txt }
