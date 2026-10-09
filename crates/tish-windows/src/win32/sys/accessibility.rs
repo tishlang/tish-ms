@@ -137,12 +137,16 @@ fn uia_selection() -> Option<String> {
     }
 }
 
+/// Tags the keystrokes this module synthesizes (`dwExtraInfo`), so a keyboard hook in the same app
+/// (Moo's snippet watcher) can skip its own typing and still see other tools'. "MOO\0".
+pub(crate) const SYNTHETIC_KEY_TAG: usize = 0x004F_4F4D;
+
 fn press(keys: &[(VIRTUAL_KEY, bool)]) {
     let inputs: Vec<INPUT> = keys
         .iter()
         .map(|(vk, up)| INPUT {
             r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: *vk, dwFlags: if *up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() } },
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: *vk, dwFlags: if *up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, dwExtraInfo: SYNTHETIC_KEY_TAG, ..Default::default() } },
         })
         .collect();
     unsafe {
@@ -180,7 +184,7 @@ fn type_text(text: &str) {
         for up in [false, true] {
             inputs.push(INPUT {
                 r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 { ki: KEYBDINPUT { wScan: u, dwFlags: KEYEVENTF_UNICODE | if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() } },
+                Anonymous: INPUT_0 { ki: KEYBDINPUT { wScan: u, dwFlags: KEYEVENTF_UNICODE | if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, dwExtraInfo: SYNTHETIC_KEY_TAG, ..Default::default() } },
             });
         }
     }
