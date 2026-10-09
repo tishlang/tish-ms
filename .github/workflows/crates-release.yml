@@ -1,0 +1,57 @@
+# Publish tishlang_ms_common, then tishlang_windows, to crates.io when a GitHub release is promoted
+# from prerelease to full release (or by hand with a tag). Versions come from the tag; crates
+# already on crates.io at that version are skipped, so a re-run resumes where it stopped.
+# Needs the CARGO_REGISTRY_TOKEN secret.
+
+name: Crates.io release
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)publish, e.g. v1.0.0"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set the versions from the tag
+        run: |
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          for d in tish-ms-common tish-windows; do
+            sed -i "0,/^version = .*/s//version = \"$VERSION\"/" "crates/$d/Cargo.toml"
+          done
+          # A path dependency needs a version too, to be published.
+          sed -i "s|^tishlang_ms_common = { path = \"../tish-ms-common\" }|tishlang_ms_common = { path = \"../tish-ms-common\", version = \"$VERSION\" }|" crates/tish-windows/Cargo.toml
+          grep -n "^version\|tishlang_ms_common" crates/tish-ms-common/Cargo.toml crates/tish-windows/Cargo.toml
+
+      - name: Publish
+        run: |
+          published() {
+            curl -sf -A "tish-ms-release (https://github.com/tishlang/tish-ms)" "https://crates.io/api/v1/crates/$1/$VERSION" >/dev/null
+          }
+          for crate in tishlang_ms_common tishlang_windows; do
+            if published "$crate"; then
+              echo "$crate $VERSION is already on crates.io; skipping."
+              continue
+            fi
+            cargo publish -p "$crate" --allow-dirty
+            # The next crate resolves this one from the index: wait until it's there.
+            for i in $(seq 1 30); do published "$crate" && break; sleep 10; done
+          done
