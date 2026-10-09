@@ -14,10 +14,9 @@ winui = ["windows/ApplicationModel_Activation", "windows/ApplicationModel_DataTr
 
 [dependencies]
 tishlang_ms_common = { path = "../tish-ms-common" }
-tishlang_core = "4.0.1"
-tishlang_ui = { version = "4.0.1", default-features = false, features = ["runtime"] }
-# `process` until tish fixes no_console_window on Windows without it.
-tishlang_runtime = { version = "4.0.1", features = ["process"] }
+tishlang_core = "4.1.1"
+tishlang_ui = { version = "4.1.1", default-features = false, features = ["runtime"] }
+tishlang_runtime = "4.1.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"

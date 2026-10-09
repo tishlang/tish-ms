@@ -7,5 +7,5 @@ license = "MIT"
 repository = "https://github.com/tishlang/tish-ms"
 
 [dependencies]
-tishlang_core = "4.0.1"
-tishlang_ui = { version = "4.0.1", default-features = false, features = ["runtime"] }
+tishlang_core = "4.1.1"
+tishlang_ui = { version = "4.1.1", default-features = false, features = ["runtime"] }
