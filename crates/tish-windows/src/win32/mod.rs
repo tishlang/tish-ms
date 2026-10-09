@@ -30,6 +30,8 @@ use render::Renderer;
 
 const TIMER_ID: usize = 1;
 const WM_SETTLED: u32 = WM_APP + 1;
+/// A resize that arrived while a commit held the app: lay out again once it's done.
+const WM_RELAYOUT: u32 = WM_APP + 2;
 const EN_CHANGE_CODE: u32 = 0x0300;
 
 /// One `textinput`: its EDIT control and the node path it belongs to.
@@ -65,6 +67,8 @@ thread_local! {
     static PENDING: RefCell<HashMap<u64, Value>> = RefCell::new(HashMap::new());
     static NEXT: Cell<u64> = const { Cell::new(1) };
     static EDIT_PROCS: RefCell<HashMap<isize, isize>> = RefCell::new(HashMap::new());
+    /// Kept outside `APP`: edit controls ask for colours while a commit holds `APP`.
+    static DARK: Cell<bool> = const { Cell::new(true) };
 }
 
 fn s(v: &str) -> Value {
@@ -346,7 +350,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let t0 = Instant::now();
             let dpi = GetDpiForWindow(hwnd) as f32;
             APP.with(|a| {
-                if let Some(app) = a.borrow_mut().as_mut() {
+                let Ok(mut guard) = a.try_borrow_mut() else {
+                    // Mid-commit: the commit invalidates when it's done.
+                    return;
+                };
+                if let Some(app) = guard.as_mut() {
                     // Under a XAML island Direct2D only clears to the backdrop.
                     #[cfg(feature = "winui")]
                     let island = app.xaml.is_some();
@@ -367,7 +375,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             let (w, h) = ((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32);
             APP.with(|a| {
-                if let Some(app) = a.borrow_mut().as_mut() {
+                let Ok(mut guard) = a.try_borrow_mut() else {
+                    let _ = PostMessageW(Some(hwnd), WM_RELAYOUT, WPARAM(0), lp);
+                    return;
+                };
+                if let Some(app) = guard.as_mut() {
                     app.renderer.resize(w, h);
                     relayout(app);
                     #[cfg(feature = "winui")]
@@ -381,6 +393,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             LRESULT(0)
         }
+        WM_RELAYOUT => SendMessageW(hwnd, WM_SIZE, Some(WPARAM(0)), Some(lp)),
         WM_DPICHANGED => {
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -422,7 +435,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CTLCOLOREDIT => {
-            let dark = APP.with(|a| a.borrow().as_ref().is_some_and(|a| a.renderer.dark));
+            let dark = DARK.with(|d| d.get());
             let hdc = HDC(wp.0 as *mut _);
             if dark {
                 SetTextColor(hdc, COLORREF(0x00F2F2F2));
@@ -597,6 +610,7 @@ fn run(args: &[Value]) -> Value {
         }
     };
     let dark = props_bool(&o, &["dark"], true);
+    DARK.with(|d| d.set(dark));
     let renderer = match Renderer::new(dark) {
         Ok(r) => r,
         Err(e) => {
