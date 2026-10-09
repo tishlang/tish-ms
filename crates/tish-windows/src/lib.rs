@@ -9,7 +9,7 @@
 //! - `windows.run(App, opts)`: render `App` into a window and run the message loop. Options:
 //!   `title`, `width`, `height`, `borderless`, `backdrop` (`"mica"`, `"acrylic"`, `"none"`),
 //!   `autoShow` (default true), `autoRunEventLoop` (default true; false returns
-//!   `{ show, hide, runEventLoop }`), `onKey(name)` (true: handled). A launcher panel adds
+//!   `{ show, hide, runEventLoop }`), `onKey(name, fieldText)` (true: handled). A launcher panel adds
 //!   `toolWindow` (no taskbar button), `topmost`, `hideOnBlur` and `onBlur()`.
 //! - `windows.window`: `show()`, `hide()`, `toggle()`, `visible()`, `setSize(w, h)`.
 //! - Services, shaped like tish-macos's: `pasteboard`, `workspace`, `shell`, `credentials`,

@@ -30,7 +30,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use render::Renderer;
 
 const TIMER_ID: usize = 1;
-const WM_SETTLED: u32 = WM_APP + 1;
 /// A resize that arrived while a commit held the app: lay out again once it's done.
 const WM_RELAYOUT: u32 = WM_APP + 2;
 const EN_CHANGE_CODE: u32 = 0x0300;
@@ -67,8 +66,6 @@ struct App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-    static PENDING: RefCell<HashMap<u64, Value>> = RefCell::new(HashMap::new());
-    static NEXT: Cell<u64> = const { Cell::new(1) };
     static EDIT_PROCS: RefCell<HashMap<isize, isize>> = RefCell::new(HashMap::new());
     /// Kept outside `APP`: edit controls ask for colours while a commit holds `APP`.
     static DARK: Cell<bool> = const { Cell::new(true) };
@@ -316,10 +313,15 @@ fn key_name(vk: VIRTUAL_KEY) -> String {
     name + &base
 }
 
-/// `onKey(name)` from `run`'s options; true when the app handled it (the key goes no further).
+/// `onKey(name, fieldText)` from `run`'s options; true when the app handled it (the key goes no
+/// further). `fieldText` is the focused input's text ("" when no input has focus), so an app can
+/// tell Backspace in an empty field from editing.
 fn route_key(vk: VIRTUAL_KEY) -> bool {
     let Some(cb) = APP.with(|a| a.try_borrow().ok()?.as_ref().and_then(|a| a.on_key.clone())) else { return false };
-    matches!(call(&cb, &[s(&key_name(vk))]), Value::Bool(true))
+    let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    let ours = APP.with(|a| a.try_borrow().ok().and_then(|a| a.as_ref().map(|a| a.edits.iter().any(|e| e.hwnd == focused)))).unwrap_or(false);
+    let text = if ours { edit_text(focused) } else { String::new() };
+    matches!(call(&cb, &[s(&key_name(vk)), s(&text)]), Value::Bool(true))
 }
 
 unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -429,17 +431,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             tishlang_runtime::drain_timers();
             LRESULT(0)
         }
-        WM_SETTLED => {
-            let id = wp.0 as u64;
-            let payload = Box::from_raw(lp.0 as *mut Settled);
-            if let Some(cb) = PENDING.with(|p| p.borrow_mut().remove(&id)) {
-                match payload.0 {
-                    Ok(v) => call(&cb, &[v, Value::Null]),
-                    Err(e) => call(&cb, &[Value::Null, e]),
-                };
-            }
-            LRESULT(0)
-        }
         WM_CTLCOLOREDIT => {
             let dark = DARK.with(|d| d.get());
             let hdc = HDC(wp.0 as *mut _);
@@ -499,35 +490,6 @@ fn working_set_mb() -> f64 {
 }
 
 // ── `windows.*` ─────────────────────────────────────────────────────────────
-
-struct Settled(Result<Value, Value>);
-struct SendPtr(HWND, Value, u64);
-unsafe impl Send for SendPtr {}
-
-fn when_settled(args: &[Value]) -> Value {
-    let Some(hwnd) = APP.with(|a| a.borrow().as_ref().map(|a| a.hwnd)) else { return Value::Null };
-    let id = NEXT.with(|n| {
-        let v = n.get();
-        n.set(v + 1);
-        v
-    });
-    PENDING.with(|p| p.borrow_mut().insert(id, args.get(1).cloned().unwrap_or(Value::Null)));
-    let carry = SendPtr(hwnd, args.first().cloned().unwrap_or(Value::Null), id);
-    std::thread::spawn(move || {
-        let carry = carry;
-        let result = match &carry.1 {
-            Value::Promise(p) => p.block_until_settled(),
-            other => Ok(other.clone()),
-        };
-        let payload = Box::into_raw(Box::new(Settled(result)));
-        unsafe {
-            if PostMessageW(Some(carry.0), WM_SETTLED, WPARAM(carry.2 as usize), LPARAM(payload as isize)).is_err() {
-                drop(Box::from_raw(payload));
-            }
-        }
-    });
-    Value::Null
-}
 
 fn backdrop_type(name: &str) -> DWM_SYSTEMBACKDROP_TYPE {
     match name {
@@ -649,7 +611,6 @@ fn run(args: &[Value]) -> Value {
             return Value::Null;
         }
     };
-    sys::set_window(hwnd);
     let on_key = opt(args.get(1), "onKey").filter(|v| matches!(v, Value::Function(_)));
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
@@ -816,7 +777,7 @@ fn start_timers(_a: &[Value]) -> Value {
 pub(crate) fn windows_object() -> Value {
     let mut w = ObjectMap::default();
     type Native = fn(&[Value]) -> Value;
-    let fns: [(&str, Native); 6] = [("run", run), ("whenSettled", when_settled), ("startTimers", start_timers), ("stats", stats), ("quit", quit), ("pump", pump)];
+    let fns: [(&str, Native); 6] = [("run", run), ("whenSettled", sys::when_settled), ("startTimers", start_timers), ("stats", stats), ("quit", quit), ("pump", pump)];
     for (k, f) in fns {
         w.insert(Arc::from(k), Value::native(f));
     }

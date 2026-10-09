@@ -100,8 +100,8 @@ pub(super) fn write_text(args: &[Value]) -> Value {
     Value::Bool(ok)
 }
 
-pub(super) fn window_ready(hwnd: HWND) {
-    if WATCHER.with(|w| w.borrow().is_some()) && !LISTENING.with(|l| l.get()) {
+fn listen(hwnd: HWND) {
+    if !LISTENING.with(|l| l.get()) {
         unsafe {
             let _ = AddClipboardFormatListener(hwnd);
         }
@@ -115,7 +115,7 @@ pub(super) fn watch(args: &[Value]) -> Value {
     }
     WATCHER.with(|w| *w.borrow_mut() = args.first().cloned());
     if let Some(h) = ui_hwnd() {
-        window_ready(h);
+        listen(h);
     }
     Value::Bool(true)
 }
