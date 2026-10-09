@@ -27,6 +27,11 @@ on:
         required: false
         default: ""
         type: string
+      after:
+        description: "PowerShell to run while the app is up (from the app's folder); its output goes to after.txt"
+        required: false
+        default: ""
+        type: string
       seconds:
         description: "How long to let it run before the screenshot"
         required: false
@@ -66,6 +71,12 @@ jobs:
             $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
             $bmp.Save("..\typed.png")
           }
+          if ("${{ inputs.after }}" -ne "") {
+            Push-Location (Split-Path -Parent ".\${{ inputs.exe }}")
+            & ([ScriptBlock]::Create("${{ inputs.after }}")) *>&1 | Out-File ..\after.txt
+            Pop-Location
+            Copy-Item -ErrorAction SilentlyContinue after.txt ..\after.txt
+          }
           "running: $(-not $p.HasExited)" | Out-File ..\status.txt
           if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "exit code: $($p.ExitCode)" | Out-File -Append ..\status.txt }
           Get-Content ..\status.txt, ..\stdout.txt, ..\stderr.txt -ErrorAction SilentlyContinue
@@ -79,3 +90,4 @@ jobs:
             stdout.txt
             stderr.txt
             status.txt
+            after.txt
