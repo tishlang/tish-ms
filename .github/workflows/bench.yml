@@ -23,8 +23,9 @@ jobs:
       - name: Download the build
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
         run: |
-          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p launcher-poc.zip
+          gh release download $env:TAG -R $env:GITHUB_REPOSITORY -p launcher-poc.zip
           Expand-Archive launcher-poc.zip -DestinationPath poc
       - name: Run the Win32 host
         working-directory: poc

@@ -9,3 +9,6 @@ repository = "https://github.com/tishlang/tish-ms"
 [dependencies]
 tishlang_core = "4.1.1"
 tishlang_ui = { version = "4.1.1", default-features = false, features = ["runtime"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
