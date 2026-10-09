@@ -13,6 +13,7 @@
 //!   Recycle Bin, dark mode, volume and mute, eject
 //! - `windows.timeZones`: `names()`, `local()`, `at(id, unix)`, `byAbbreviation(abbr)`
 //! - `windows.systemInfo()`, `windows.screens()`
+//! - `windows.contacts`: `status()`, `request(cb)`, `query(text, limit, cb)` (needs MSIX packaging)
 //! - `windows.accessibility`: `trusted()`, `selectedText()`, `replaceBeforeCursor(typed, text)`,
 //!   `focusedWindow()`, `setFocusedWindowFrame(x, y, w, h)`, `windowAction(pid, action)`
 //! - `windows.icons`: `file(path)` (the shell's icon), `image(path)` (an image file),
@@ -24,6 +25,7 @@
 
 mod accessibility;
 mod apps;
+mod contacts;
 mod credentials;
 mod hotkeys;
 mod pasteboard;
@@ -327,6 +329,7 @@ pub(super) fn install(w: &mut ObjectMap) {
         ]),
     );
     w.insert(Arc::from("screens"), Value::native(accessibility::screens));
+    w.insert(Arc::from("contacts"), namespace(vec![("status", contacts::status), ("request", contacts::request), ("query", contacts::query)]));
     w.insert(
         Arc::from("icons"),
         namespace(vec![("file", icon_file), ("image", icon_image), ("symbol", icon_symbol), ("onLoaded", icon_on_loaded)]),

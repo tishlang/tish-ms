@@ -24,6 +24,8 @@ windows-numerics = "0.3"
 windows-collections = "0.3"
 windows-future = "0.3"
 windows = { version = "0.62", features = [
+    "ApplicationModel_Contacts",
+    "Security_Authorization_AppCapabilityAccess",
     "Foundation",
     "Foundation_Collections",
     "Foundation_Numerics",
