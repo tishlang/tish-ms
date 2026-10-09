@@ -7,11 +7,10 @@ license = "MIT"
 repository = "https://github.com/tishlang/tish-ms"
 
 [features]
-# Both hosts are built while the WinUI proof of concept is being measured; TISH_WINDOWS_HOST picks.
-default = ["winui"]
+default = []
 # Proof of concept: a WinUI 3 (Windows App SDK) host beside the Win32 one. TISH_WINDOWS_HOST=winui
 # picks it at run time.
-winui = ["windows/ApplicationModel_DataTransfer", "windows/ApplicationModel_DataTransfer_DragDrop", "windows/Foundation", "windows/Graphics", "windows/Graphics_Effects", "windows/Graphics_Imaging", "windows/Storage_Streams", "windows/System", "windows/UI", "windows/UI_Composition", "windows/UI_Core", "windows/UI_Text"]
+winui = ["windows/ApplicationModel_Activation", "windows/ApplicationModel_DataTransfer", "windows/ApplicationModel_DataTransfer_DragDrop", "windows/Foundation", "windows/Foundation_Collections", "windows/Graphics", "windows/Graphics_Effects", "windows/Graphics_Imaging", "windows/Storage_Streams", "windows/System", "windows/UI", "windows/UI_Composition", "windows/UI_Core", "windows/UI_Text"]
 
 [dependencies]
 tishlang_ms_common = { path = "../tish-ms-common" }
@@ -43,6 +42,14 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",

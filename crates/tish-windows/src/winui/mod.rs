@@ -12,11 +12,11 @@
 mod bindings;
 
 use bindings::Microsoft::UI::Dispatching::DispatcherQueueController;
-use bindings::Microsoft::UI::Xaml::Controls::{Border, Canvas, TextBlock, TextBox, TextChangedEventHandler};
+use bindings::Microsoft::UI::Xaml::Controls::{Border, Canvas, TextBlock, TextBox, TextChangedEventHandler, XamlControlsResources};
 use bindings::Microsoft::UI::Xaml::Hosting::{DesktopWindowXamlSource, WindowsXamlManager};
 use bindings::Microsoft::UI::Xaml::Input::KeyEventHandler;
 use bindings::Microsoft::UI::Xaml::Media::SolidColorBrush;
-use bindings::Microsoft::UI::Xaml::{CornerRadius, UIElement};
+use bindings::Microsoft::UI::Xaml::{Application, CornerRadius, ResourceDictionary, UIElement};
 use bindings::Microsoft::UI::WindowId;
 use tishlang_ms_common::layout::{font, padding};
 use tishlang_ms_common::style::{props_color, props_f64, props_string, Rgba};
@@ -60,6 +60,7 @@ impl Elem {
 
 pub(crate) struct Xaml {
     _queue: DispatcherQueueController,
+    _app: Application,
     _manager: WindowsXamlManager,
     source: DesktopWindowXamlSource,
     canvas: Canvas,
@@ -113,6 +114,14 @@ impl Xaml {
         bootstrap()?;
         let e = |e: windows::core::Error| e.to_string();
         let queue = DispatcherQueueController::CreateOnCurrentThread().map_err(e)?;
+        // An island needs a XAML Application on the thread, with WinUI's control styles in its
+        // resources (TextBox and friends have no template without them).
+        let app = match Application::Current() {
+            Ok(a) => a,
+            Err(_) => Application::new().map_err(|x| format!("Application: {x}"))?,
+        };
+        let styles: ResourceDictionary = XamlControlsResources::new().map_err(|x| format!("XamlControlsResources: {x}"))?.cast().map_err(e)?;
+        app.Resources().and_then(|r| r.MergedDictionaries()).and_then(|m| m.Append(&styles)).map_err(|x| format!("merging the control styles: {x}"))?;
         let manager = WindowsXamlManager::InitializeForCurrentThread().map_err(e)?;
         let source = DesktopWindowXamlSource::new().map_err(e)?;
         source.Initialize(WindowId { Value: hwnd.0 as u64 }).map_err(e)?;
@@ -127,7 +136,7 @@ impl Xaml {
             Ok(())
         });
         canvas.PreviewKeyDown(&handler).map_err(e)?;
-        Ok(Self { _queue: queue, _manager: manager, source, canvas, elems: Vec::new(), hooks, dark })
+        Ok(Self { _queue: queue, _app: app, _manager: manager, source, canvas, elems: Vec::new(), hooks, dark })
     }
 
     /// The island fills the client area (`w` × `h` physical pixels).

@@ -3,6 +3,7 @@
 //! (`whenSettled`) comes back as a posted message.
 
 mod render;
+mod sys;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -30,6 +31,8 @@ use render::Renderer;
 
 const TIMER_ID: usize = 1;
 const WM_SETTLED: u32 = WM_APP + 1;
+/// A resize that arrived while a commit held the app: lay out again once it's done.
+const WM_RELAYOUT: u32 = WM_APP + 2;
 const EN_CHANGE_CODE: u32 = 0x0300;
 
 /// One `textinput`: its EDIT control and the node path it belongs to.
@@ -54,6 +57,8 @@ struct App {
     roots: Vec<Node>,
     edits: Vec<Edit>,
     on_key: Option<Value>,
+    on_blur: Option<Value>,
+    hide_on_blur: bool,
     stats: Stats,
     painted: bool,
     #[cfg(feature = "winui")]
@@ -65,6 +70,8 @@ thread_local! {
     static PENDING: RefCell<HashMap<u64, Value>> = RefCell::new(HashMap::new());
     static NEXT: Cell<u64> = const { Cell::new(1) };
     static EDIT_PROCS: RefCell<HashMap<isize, isize>> = RefCell::new(HashMap::new());
+    /// Kept outside `APP`: edit controls ask for colours while a commit holds `APP`.
+    static DARK: Cell<bool> = const { Cell::new(true) };
 }
 
 fn s(v: &str) -> Value {
@@ -339,6 +346,9 @@ fn handler_at(x: f64, y: f64, name: &str) -> Option<Value> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(r) = sys::handle(hwnd, msg, wp, lp) {
+        return r;
+    }
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
@@ -346,7 +356,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let t0 = Instant::now();
             let dpi = GetDpiForWindow(hwnd) as f32;
             APP.with(|a| {
-                if let Some(app) = a.borrow_mut().as_mut() {
+                let Ok(mut guard) = a.try_borrow_mut() else {
+                    // Mid-commit: the commit invalidates when it's done.
+                    return;
+                };
+                if let Some(app) = guard.as_mut() {
                     // Under a XAML island Direct2D only clears to the backdrop.
                     #[cfg(feature = "winui")]
                     let island = app.xaml.is_some();
@@ -367,7 +381,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             let (w, h) = ((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32);
             APP.with(|a| {
-                if let Some(app) = a.borrow_mut().as_mut() {
+                let Ok(mut guard) = a.try_borrow_mut() else {
+                    let _ = PostMessageW(Some(hwnd), WM_RELAYOUT, WPARAM(0), lp);
+                    return;
+                };
+                if let Some(app) = guard.as_mut() {
                     app.renderer.resize(w, h);
                     relayout(app);
                     #[cfg(feature = "winui")]
@@ -381,6 +399,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             LRESULT(0)
         }
+        WM_RELAYOUT => SendMessageW(hwnd, WM_SIZE, Some(WPARAM(0)), Some(lp)),
         WM_DPICHANGED => {
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -422,7 +441,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CTLCOLOREDIT => {
-            let dark = APP.with(|a| a.borrow().as_ref().is_some_and(|a| a.renderer.dark));
+            let dark = DARK.with(|d| d.get());
             let hdc = HDC(wp.0 as *mut _);
             if dark {
                 SetTextColor(hdc, COLORREF(0x00F2F2F2));
@@ -431,7 +450,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+        WM_ACTIVATE if (wp.0 & 0xffff) == 0 => {
+            // Deactivated: another window took focus.
+            let (hide, cb) = APP.with(|a| a.try_borrow().ok().and_then(|a| a.as_ref().map(|a| (a.hide_on_blur, a.on_blur.clone())))).unwrap_or((false, None));
+            if hide {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            if let Some(cb) = cb {
+                call(&cb, &[]);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            sys::remove_tray();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -523,8 +554,16 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         let title = wide(&props_string(o, &["title"]).unwrap_or_else(|| "Tish".into()));
         let borderless = props_bool(o, &["borderless"], false);
         let style = if borderless { WS_POPUP | WS_THICKFRAME } else { WS_OVERLAPPEDWINDOW };
+        // A launcher panel: no taskbar button, above other windows.
+        let mut ex = WINDOW_EX_STYLE::default();
+        if props_bool(o, &["toolWindow"], false) {
+            ex |= WS_EX_TOOLWINDOW;
+        }
+        if props_bool(o, &["topmost"], false) {
+            ex |= WS_EX_TOPMOST;
+        }
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            ex,
             class,
             PCWSTR(title.as_ptr()),
             style,
@@ -587,6 +626,11 @@ fn show(hwnd: HWND) {
 }
 
 fn run(args: &[Value]) -> Value {
+    // The UI thread is a single-threaded apartment: XAML requires it, and so do the clipboard and
+    // drag and drop through OLE.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
     let app_fn = args.first().cloned().unwrap_or(Value::Null);
     let o = opt_props(args.get(1));
     let hwnd = match create_window(&o) {
@@ -597,6 +641,7 @@ fn run(args: &[Value]) -> Value {
         }
     };
     let dark = props_bool(&o, &["dark"], true);
+    DARK.with(|d| d.set(dark));
     let renderer = match Renderer::new(dark) {
         Ok(r) => r,
         Err(e) => {
@@ -604,6 +649,7 @@ fn run(args: &[Value]) -> Value {
             return Value::Null;
         }
     };
+    sys::set_window(hwnd);
     let on_key = opt(args.get(1), "onKey").filter(|v| matches!(v, Value::Function(_)));
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
@@ -612,6 +658,8 @@ fn run(args: &[Value]) -> Value {
             roots: Vec::new(),
             edits: Vec::new(),
             on_key,
+            on_blur: opt(args.get(1), "onBlur").filter(|v| matches!(v, Value::Function(_))),
+            hide_on_blur: props_bool(&o, &["hideOnBlur"], false),
             stats: Stats::default(),
             painted: false,
             #[cfg(feature = "winui")]
@@ -677,6 +725,53 @@ fn host_name(_app: &App) -> &'static str {
     "win32"
 }
 
+fn app_hwnd() -> Option<HWND> {
+    APP.with(|a| a.try_borrow().ok()?.as_ref().map(|a| a.hwnd))
+}
+
+fn win_show(_a: &[Value]) -> Value {
+    if let Some(h) = app_hwnd() {
+        show(h);
+    }
+    Value::Null
+}
+
+fn win_hide(_a: &[Value]) -> Value {
+    if let Some(h) = app_hwnd() {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+    }
+    Value::Null
+}
+
+fn win_visible(_a: &[Value]) -> Value {
+    Value::Bool(app_hwnd().is_some_and(|h| unsafe { IsWindowVisible(h) }.as_bool()))
+}
+
+fn win_toggle(a: &[Value]) -> Value {
+    if matches!(win_visible(a), Value::Bool(true)) {
+        win_hide(a)
+    } else {
+        win_show(a)
+    }
+}
+
+/// `setSize(w, h)` in DIPs, keeping the window's top edge and horizontal centre.
+fn win_set_size(args: &[Value]) -> Value {
+    let Some(h) = app_hwnd() else { return Value::Null };
+    let num = |i: usize| args.get(i).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let sc = dpi_scale(h);
+    let (w, ht) = ((num(0) * sc) as i32, (num(1) * sc) as i32);
+    unsafe {
+        let mut r = RECT::default();
+        let _ = GetWindowRect(h, &mut r);
+        let cx = (r.left + r.right) / 2;
+        let _ = SetWindowPos(h, None, cx - w / 2, r.top, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    Value::Null
+}
+
 fn stats(_a: &[Value]) -> Value {
     APP.with(|a| {
         let a = a.borrow();
@@ -725,6 +820,13 @@ pub(crate) fn windows_object() -> Value {
     for (k, f) in fns {
         w.insert(Arc::from(k), Value::native(f));
     }
+    sys::install(&mut w);
+    let mut win = ObjectMap::default();
+    let wfns: [(&str, Native); 5] = [("show", win_show), ("hide", win_hide), ("toggle", win_toggle), ("visible", win_visible), ("setSize", win_set_size)];
+    for (k, f) in wfns {
+        win.insert(Arc::from(k), Value::native(f));
+    }
+    w.insert(Arc::from("window"), Value::object(win));
     let mut m = ObjectMap::default();
     m.insert(Arc::from("windows"), Value::object(w));
     m.insert(Arc::from("useState"), Value::native(tishlang_ui::native_use_state));
