@@ -126,6 +126,11 @@ impl Host for Win32Host {
             let roots = from_vnode(vnode);
             app.roots = roots;
             relayout(app);
+            if std::env::var_os("TISH_WINDOWS_DUMP").is_some() && app.stats.commits < 3 {
+                for r in &app.roots {
+                    dump(r, 0);
+                }
+            }
             #[cfg(feature = "winui")]
             if let Some(x) = app.xaml.as_mut() {
                 if let Err(e) = x.commit(&app.roots) {
@@ -146,6 +151,16 @@ impl Host for Win32Host {
                 let _ = InvalidateRect(Some(app.hwnd), None, false);
             }
         });
+    }
+}
+
+/// TISH_WINDOWS_DUMP=1: the laid-out tree on stderr (first commits), for debugging an app's layout.
+fn dump(n: &Node, depth: usize) {
+    let f = n.frame;
+    let text: String = n.text.chars().take(40).collect();
+    eprintln!("{:indent$}{} [{:.0},{:.0} {:.0}x{:.0}] {}", "", n.tag, f.x, f.y, f.w, f.h, text, indent = depth * 2);
+    for c in &n.children {
+        dump(c, depth + 1);
     }
 }
 
