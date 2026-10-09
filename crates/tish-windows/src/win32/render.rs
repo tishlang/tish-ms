@@ -175,13 +175,26 @@ impl Renderer {
                 "image" if f.h > 1.0 => {
                     let s = f.h.min(f.w) as f32;
                     let r = D2D_RECT_F { left: f.x as f32, top: f.y as f32, right: f.x as f32 + s, bottom: f.y as f32 + s };
-                    let src = tishlang_ms_common::style::props_string(&n.props, &["src"]).unwrap_or_default();
+                    let mut src = tishlang_ms_common::style::props_string(&n.props, &["src"]).unwrap_or_default();
+                    // `symbol={true}`: `src` is an SF Symbol name, as tish-macos takes it.
+                    if tishlang_ms_common::style::props_bool(&n.props, &["symbol", "sfSymbol"], false) {
+                        src = super::sys::symbols::glyph(&src).unwrap_or_default();
+                    }
+                    if let Some(text) = src.strip_prefix("glyph:").or_else(|| src.strip_prefix("label:")) {
+                        // A symbol: the glyph centred in the icon's square, in its tint.
+                        let family = if src.starts_with("glyph:") { "Segoe Fluent Icons" } else { "Segoe UI Variable Text" };
+                        let c = props_color(&n.props, &["tint", "color"]).unwrap_or_else(|| self.default_text());
+                        let b = t.CreateSolidColorBrush(&color(c), None)?;
+                        let tl = self.symbol_layout(text, family, s * 0.78, s)?;
+                        t.DrawTextLayout(Vector2 { X: r.left, Y: r.top }, &tl, &b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    } else {
                     match self.bitmap(t, &src, s) {
                         Some(bmp) => t.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
                         None => {
                             let b = t.CreateSolidColorBrush(&color(Rgba { r: 0.5, g: 0.5, b: 0.5, a: 0.35 }), None)?;
                             t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: s / 5.0, radiusY: s / 5.0 }, &b);
                         }
+                    }
                     }
                 }
                 _ => {}
@@ -221,6 +234,20 @@ impl Renderer {
         let b = unsafe { t.CreateBitmapFromWicBitmap(&source, None) }.ok()?;
         self.bitmaps.borrow_mut().insert(key, b.clone());
         Some(b)
+    }
+
+    /// `text` in `family` at `size`, centred in a `box_` × `box_` square. Segoe Fluent Icons falls
+    /// back to Segoe MDL2 Assets (Windows 10) through DirectWrite's font fallback.
+    fn symbol_layout(&self, text: &str, family: &str, size: f32, box_: f32) -> Result<IDWriteTextLayout> {
+        let fam: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
+        let locale = wide("en-us\0");
+        unsafe {
+            let tf = self.dw.CreateTextFormat(PCWSTR(fam.as_ptr()), None, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, PCWSTR(locale.as_ptr()))?;
+            tf.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            tf.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let w = wide(text);
+            self.dw.CreateTextLayout(&w, &tf, box_, box_)
+        }
     }
 
     #[allow(clippy::question_mark)] // one branch per source kind reads clearer than `?` chains

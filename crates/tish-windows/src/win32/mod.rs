@@ -3,7 +3,7 @@
 //! (`whenSettled`) comes back as a posted message.
 
 mod render;
-mod sys;
+pub(crate) mod sys;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

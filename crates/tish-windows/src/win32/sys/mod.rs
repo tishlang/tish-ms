@@ -16,7 +16,7 @@
 //! - `windows.accessibility`: `trusted()`, `selectedText()`, `replaceBeforeCursor(typed, text)`,
 //!   `focusedWindow()`, `setFocusedWindowFrame(x, y, w, h)`, `windowAction(pid, action)`
 //! - `windows.icons`: `file(path)` (the shell's icon), `image(path)` (an image file),
-//!   `symbol(name)` ("" for now), `onLoaded(cb)`: names to use as an `<image src>`
+//!   `symbol(name)` (an SF Symbol name, drawn from Segoe Fluent Icons), `onLoaded(cb)`: names to use as an `<image src>`
 //!
 //! Callbacks always run on the UI thread. Work done elsewhere (shell commands) comes back as a
 //! posted message, like `whenSettled`. The services have their own hidden window, made on first
@@ -28,6 +28,7 @@ mod credentials;
 mod hotkeys;
 mod pasteboard;
 mod shell;
+pub(crate) mod symbols;
 mod sysinfo;
 mod system;
 mod timezones;
@@ -245,9 +246,9 @@ fn icon_image(args: &[Value]) -> Value {
     if p.is_empty() { s("") } else { s(&format!("image:{p}")) }
 }
 
-/// No symbol font mapping yet: rows show their placeholder.
-fn icon_symbol(_a: &[Value]) -> Value {
-    s("")
+/// An SF Symbol name as a Segoe Fluent Icons glyph (symbols.rs); "" when there's none.
+fn icon_symbol(args: &[Value]) -> Value {
+    s(&symbols::glyph(&str_arg(args, 0)).unwrap_or_default())
 }
 
 /// Icons load as they're first drawn, so there's never a later "loaded" moment.
