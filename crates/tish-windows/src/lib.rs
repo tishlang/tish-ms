@@ -9,7 +9,11 @@
 //! - `windows.run(App, opts)`: render `App` into a window and run the message loop. Options:
 //!   `title`, `width`, `height`, `borderless`, `backdrop` (`"mica"`, `"acrylic"`, `"none"`),
 //!   `autoShow` (default true), `autoRunEventLoop` (default true; false returns
-//!   `{ show, hide, runEventLoop }`).
+//!   `{ show, hide, runEventLoop }`), `onKey(name)` (true: handled). A launcher panel adds
+//!   `toolWindow` (no taskbar button), `topmost`, `hideOnBlur` and `onBlur()`.
+//! - `windows.window`: `show()`, `hide()`, `toggle()`, `visible()`, `setSize(w, h)`.
+//! - Services, shaped like tish-macos's: `pasteboard`, `workspace`, `shell`, `credentials`,
+//!   `hotkeys`, `statusItem`, `apps` (see `win32/sys`).
 //! - `windows.whenSettled(promise, cb)`: wait for a Tish promise off the UI thread, then
 //!   `cb(value, error)` on it.
 //! - `windows.startTimers()`: drive `setTimeout` / `setInterval` from the message loop (`run`

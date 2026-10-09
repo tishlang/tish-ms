@@ -88,7 +88,37 @@ fn bench() {
   }
   let st = windows.stats()
   console.log(JSON.stringify({ stats: st, keystrokes: times, results: shown }))
-  windows.quit()
+  smoke()
+}
+
+// Every service once, so one Windows run checks them all.
+fn smoke() {
+  let out = {}
+  out.pasteboardWrite = windows.pasteboard.writeText('tish smoke ✓')
+  out.pasteboardRead = windows.pasteboard.readText()
+  out.credSet = windows.credentials.set('tish-smoke', 's3cret ✓')
+  out.credGet = windows.credentials.get('tish-smoke')
+  out.credHas = windows.credentials.has('tish-smoke')
+  out.credDelete = windows.credentials.delete('tish-smoke')
+  out.credAfter = windows.credentials.has('tish-smoke')
+  let apps = windows.apps.installed()
+  out.apps = apps.length
+  out.firstApps = apps.slice(0, 3)
+  out.hotkeyCheck = windows.hotkeys.check('ctrl+alt+shift+f12')
+  out.hotkeyBad = windows.hotkeys.check('nope')
+  out.hotkeyDisplay = windows.hotkeys.display('cmd+shift+space')
+  let id = windows.hotkeys.register('ctrl+alt+shift+f11', () => {})
+  out.hotkeyRegistered = id
+  windows.hotkeys.unregister(id)
+  out.tray = windows.statusItem({ tooltip: 'tish smoke', menu: [{ title: 'Quit', id: 'quit' }] })
+  out.windowVisible = windows.window.visible()
+  let t0 = Date.now()
+  windows.shell.run('Write-Output ("arg=" + $args[0]); Write-Error "oops"; exit 3', { args: ["it's; $(whoami)"] }, (r) => {
+    out.shell = r
+    out.shellWallMs = Date.now() - t0
+    console.log(JSON.stringify({ smoke: out }))
+    windows.quit()
+  })
 }
 
 if (BENCH) {
