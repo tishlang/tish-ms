@@ -600,6 +600,11 @@ fn show(hwnd: HWND) {
 }
 
 fn run(args: &[Value]) -> Value {
+    // The UI thread is a single-threaded apartment: XAML requires it, and so do the clipboard and
+    // drag and drop through OLE.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
     let app_fn = args.first().cloned().unwrap_or(Value::Null);
     let o = opt_props(args.get(1));
     let hwnd = match create_window(&o) {
