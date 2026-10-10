@@ -80,6 +80,13 @@ jobs:
             $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
             $bmp.Save("..\typed.png")
           }
+          # `Shot name` in the after script saves shots\name.png (uploaded with the rest).
+          New-Item -ItemType Directory -Force ..\shots | Out-Null
+          $shots = (Resolve-Path ..\shots).Path
+          function Shot([string]$name) {
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save((Join-Path $shots "$name.png"))
+          }
           if ($env:APP_AFTER -ne "") {
             Push-Location (Split-Path -Parent (Join-Path . $env:APP_EXE))
             & ([ScriptBlock]::Create($env:APP_AFTER)) *>&1 | Out-File ..\after.txt
@@ -103,3 +110,4 @@ jobs:
             status.txt
             after.txt
             after.png
+            shots/
