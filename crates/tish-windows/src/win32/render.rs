@@ -33,9 +33,28 @@ pub struct Renderer {
     pub dark: bool,
     /// Drawn over the backdrop before everything else (the panel's tint), by dark mode.
     pub tint: Option<(Rgba, Rgba)>,
+    /// Over the tint: how much the panel dims what is behind it (the Mac glass's scrim).
+    pub scrim: Option<(Rgba, Rgba)>,
+    /// The window's corner radius (DIPs) and the hairline drawn along its edge.
+    pub radius: f32,
+    pub edge: Option<(Rgba, Rgba)>,
+    /// What is behind the window, blurred: drawn first, so the panel reads as frosted glass on
+    /// any machine (DWM's acrylic needs a GPU).
+    backdrop: Option<Backdrop>,
+    backdrop_bitmap: RefCell<Option<ID2D1Bitmap>>,
     /// The text inputs' state (their EDIT controls are kept off-screen; the field is drawn here).
     fields: RefCell<Vec<Field>>,
     field_at: std::cell::Cell<usize>,
+}
+
+/// The screen behind the window, blurred, at a fraction of its pixel size.
+pub struct Backdrop {
+    /// Premultiplied BGRA, `w` × `h`, opaque.
+    pub pixels: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    /// The screen rectangle it covers, in physical pixels.
+    pub screen: RECT,
 }
 
 /// One `textinput`'s text and selection, in tree order.
@@ -65,7 +84,7 @@ impl Renderer {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
-            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
+            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, scrim: None, radius: 0.0, edge: None, backdrop: None, backdrop_bitmap: RefCell::new(None), fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
         }
     }
 
@@ -125,6 +144,37 @@ impl Renderer {
         Ok(t)
     }
 
+    pub fn set_backdrop(&mut self, b: Option<Backdrop>) {
+        self.backdrop = b;
+        *self.backdrop_bitmap.borrow_mut() = None;
+    }
+
+    /// The blurred backdrop, scaled up over the part of the screen the window covers.
+    fn draw_backdrop(&self, t: &ID2D1HwndRenderTarget, hwnd: HWND, dpi: f32) -> Result<()> {
+        let Some(b) = &self.backdrop else { return Ok(()) };
+        if self.backdrop_bitmap.borrow().is_none() {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let bmp = unsafe { t.CreateBitmap(D2D_SIZE_U { width: b.w, height: b.h }, Some(b.pixels.as_ptr() as _), b.w * 4, &props)? };
+            *self.backdrop_bitmap.borrow_mut() = Some(bmp);
+        }
+        let Some(bmp) = self.backdrop_bitmap.borrow().clone() else { return Ok(()) };
+        let mut win = RECT::default();
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut win)? };
+        let sc = dpi / 96.0;
+        let dest = D2D_RECT_F {
+            left: (b.screen.left - win.left) as f32 / sc,
+            top: (b.screen.top - win.top) as f32 / sc,
+            right: (b.screen.right - win.left) as f32 / sc,
+            bottom: (b.screen.bottom - win.top) as f32 / sc,
+        };
+        unsafe { t.DrawBitmap(&bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        Ok(())
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         if let Some(t) = &self.target {
             unsafe {
@@ -149,16 +199,36 @@ impl Renderer {
             Some((dark, light)) => color(if self.dark { dark } else { light }),
             None => D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         };
+        let pick = |c: Option<(Rgba, Rgba)>| c.map(|(d, l)| if self.dark { d } else { l });
         unsafe {
             t.BeginDraw();
-            t.Clear(Some(&clear));
+            if self.backdrop.is_some() {
+                t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
+                self.draw_backdrop(&t, hwnd, dpi)?;
+                let size = t.GetSize();
+                let all = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
+                for c in [pick(self.tint), pick(self.scrim)].into_iter().flatten() {
+                    let b = t.CreateSolidColorBrush(&color(c), None)?;
+                    t.FillRectangle(&all, &b);
+                }
+            } else {
+                t.Clear(Some(&clear));
+            }
             for n in roots {
                 self.draw(&t, n)?;
+            }
+            if let Some(e) = pick(self.edge) {
+                // The hairline just inside the window's rounded edge.
+                let size = t.GetSize();
+                let b = t.CreateSolidColorBrush(&color(e), None)?;
+                let r = D2D_RECT_F { left: 0.5, top: 0.5, right: size.width - 0.5, bottom: size.height - 0.5 };
+                t.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: self.radius, radiusY: self.radius }, &b, 1.0, None);
             }
             if let Err(e) = t.EndDraw(None, None) {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.target = None;
                     self.bitmaps.borrow_mut().clear();
+                    *self.backdrop_bitmap.borrow_mut() = None;
                 } else {
                     return Err(e);
                 }

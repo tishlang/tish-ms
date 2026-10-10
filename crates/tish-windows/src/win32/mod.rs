@@ -27,7 +27,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, 
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VIRTUAL_KEY};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use render::{Field, Renderer};
+use render::{Backdrop, Field, Renderer};
 
 const TIMER_ID: usize = 1;
 /// A resize that arrived while a commit held the app: lay out again once it's done.
@@ -429,6 +429,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 };
                 if let Some(app) = guard.as_mut() {
                     app.renderer.resize(w, h);
+                    // The panel's own rounded corners (DWM rounds only with a GPU, and only 8 px).
+                    let r = (app.renderer.radius as f64 * dpi_scale(hwnd) * 2.0).round() as i32;
+                    if r > 0 {
+                        let rgn = CreateRoundRectRgn(0, 0, w as i32 + 1, h as i32 + 1, r, r);
+                        let _ = SetWindowRgn(hwnd, Some(rgn), true);
+                    }
                     relayout(app);
                     #[cfg(feature = "winui")]
                     if let Some(x) = app.xaml.as_mut() {
@@ -615,12 +621,16 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         let dark = props_bool(o, &["dark"], true);
         let on: windows::core::BOOL = dark.into();
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const _ as _, 4);
-        let corner = DWMWCP_ROUND;
+        let own = props_f64(o, &["radius", "cornerRadius"], 0.0) > 0.0;
+        let corner = if own { DWMWCP_DONOTROUND } else { DWMWCP_ROUND };
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
         let backdrop = backdrop_type(&props_string(o, &["backdrop"]).unwrap_or_default());
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
         // A hairline edge, as the Mac panel's (DWM takes an opaque colour).
-        if let Some(e) = props_string(o, &["edge"]).and_then(|s| tishlang_ms_common::style::parse_color(&s)) {
+        if own {
+            let none = COLORREF(0xFFFF_FFFE);
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const _ as _, 4);
+        } else if let Some(e) = props_string(o, &["edge"]).and_then(|s| tishlang_ms_common::style::parse_color(&s)) {
             // Its alpha over the panel (dark or light), as DWM draws the border opaque.
             let base = if props_bool(o, &["dark"], true) { 0.1f32 } else { 0.96 };
             let mix = |v: f32| (((v * e.a + base * (1.0 - e.a)) * 255.0).round() as u32).min(255);
@@ -654,6 +664,17 @@ fn show(hwnd: HWND) {
             x.focus_input();
         }
     });
+    // What is behind the panel, taken while it is still hidden.
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        let b = capture_behind(hwnd);
+        APP.with(|a| {
+            if let Some(app) = a.borrow_mut().as_mut() {
+                if app.renderer.radius > 0.0 || app.renderer.tint.is_some() {
+                    app.renderer.set_backdrop(b);
+                }
+            }
+        });
+    }
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -695,6 +716,13 @@ fn run(args: &[Value]) -> Value {
             if let Some(d) = c("tint") {
                 r.tint = Some((d, c("tintLight").unwrap_or(d)));
             }
+            if let Some(d) = c("scrim") {
+                r.scrim = Some((d, c("scrimLight").unwrap_or(d)));
+            }
+            if let Some(d) = c("edge") {
+                r.edge = Some((d, c("edgeLight").unwrap_or(d)));
+            }
+            r.radius = props_f64(&o, &["radius", "cornerRadius"], 0.0) as f32;
             r
         }
         Err(e) => {
@@ -810,6 +838,66 @@ fn win_toggle(a: &[Value]) -> Value {
 }
 
 /// `setSize(w, h)` in DIPs, keeping the window's top edge and horizontal centre.
+/// The screen under the window's column, from the work area's top to its bottom (the panel grows
+/// and may move up), at a quarter of its pixels, blurred: the backdrop for frosted glass.
+fn capture_behind(hwnd: HWND) -> Option<Backdrop> {
+    const DOWN: i32 = 4;
+    unsafe {
+        let mut win = RECT::default();
+        GetWindowRect(hwnd, &mut win).ok()?;
+        let work = work_area(hwnd);
+        let screen = RECT { left: win.left, top: work.top, right: win.right, bottom: work.bottom };
+        let (sw, sh) = (screen.right - screen.left, screen.bottom - screen.top);
+        let (w, h) = ((sw / DOWN).max(1), (sh / DOWN).max(1));
+        let sdc = GetDC(None);
+        let mdc = CreateCompatibleDC(Some(sdc));
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(Some(mdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let old = SelectObject(mdc, dib.into());
+        SetStretchBltMode(mdc, HALFTONE);
+        let _ = StretchBlt(mdc, 0, 0, w, h, Some(sdc), screen.left, screen.top, sw, sh, SRCCOPY);
+        let n = (w * h * 4) as usize;
+        let mut px = std::slice::from_raw_parts(bits as *const u8, n).to_vec();
+        SelectObject(mdc, old);
+        let _ = DeleteObject(dib.into());
+        let _ = DeleteDC(mdc);
+        ReleaseDC(None, sdc);
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+        // Three box blurs approach a Gaussian; 8 px here is 32 on screen.
+        for _ in 0..3 {
+            box_blur(&mut px, w as usize, h as usize, 8);
+        }
+        Some(Backdrop { pixels: px, w: w as u32, h: h as u32, screen })
+    }
+}
+
+/// One horizontal and one vertical box blur of radius `r`, in place, on BGRA rows.
+fn box_blur(px: &mut [u8], w: usize, h: usize, r: usize) {
+    let mut tmp = px.to_vec();
+    let pass = |src: &[u8], dst: &mut [u8], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+        let win = (2 * r + 1) as u32;
+        for l in 0..lines {
+            for c in 0..4 {
+                let get = |i: isize| src[at(l, i.clamp(0, len as isize - 1) as usize) + c] as u32;
+                let mut sum: u32 = (-(r as isize)..=r as isize).map(get).sum();
+                for i in 0..len {
+                    dst[at(l, i) + c] = (sum / win) as u8;
+                    sum += get(i as isize + r as isize + 1);
+                    sum -= get(i as isize - r as isize);
+                }
+            }
+        }
+    };
+    pass(px, &mut tmp, w, h, &|row, x| (row * w + x) * 4);
+    pass(&tmp, px, h, w, &|col, y| (y * w + col) * 4);
+}
+
 /// How much bigger the window is than its client area (the frame DWM keeps for the border and
 /// rounded corners), so a size asked for is the content's.
 fn frame_extra(h: HWND) -> (i32, i32) {
