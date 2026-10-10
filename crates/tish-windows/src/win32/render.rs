@@ -31,6 +31,20 @@ pub struct Renderer {
     bitmaps: RefCell<HashMap<(String, u32), ID2D1Bitmap>>,
     wic: Option<IWICImagingFactory>,
     pub dark: bool,
+    /// Drawn over the backdrop before everything else (the panel's tint), by dark mode.
+    pub tint: Option<(Rgba, Rgba)>,
+    /// The text inputs' state (their EDIT controls are kept off-screen; the field is drawn here).
+    fields: RefCell<Vec<Field>>,
+    field_at: std::cell::Cell<usize>,
+}
+
+/// One `textinput`'s text and selection, in tree order.
+#[derive(Clone, Default)]
+pub struct Field {
+    pub text: String,
+    /// UTF-16 offsets, start <= end.
+    pub sel: (u32, u32),
+    pub focused: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -51,7 +65,7 @@ impl Renderer {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
-            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark })
+            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
         }
     }
 
@@ -127,11 +141,17 @@ impl Renderer {
         }
     }
 
-    pub fn paint(&mut self, hwnd: HWND, dpi: f32, roots: &[Node]) -> Result<()> {
+    pub fn paint(&mut self, hwnd: HWND, dpi: f32, roots: &[Node], fields: Vec<Field>) -> Result<()> {
         let t = self.ensure_target(hwnd, dpi)?;
+        *self.fields.borrow_mut() = fields;
+        self.field_at.set(0);
+        let clear = match self.tint {
+            Some((dark, light)) => color(if self.dark { dark } else { light }),
+            None => D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        };
         unsafe {
             t.BeginDraw();
-            t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            t.Clear(Some(&clear));
             for n in roots {
                 self.draw(&t, n)?;
             }
@@ -162,7 +182,22 @@ impl Renderer {
             match n.tag.as_str() {
                 "text" | "button" if !n.text.is_empty() => {
                     let (pt, pr, _, pl) = tishlang_ms_common::layout::padding(&n.props);
-                    let tl = self.text_layout(&n.text, &font(&n.props), f.w - pl - pr, true)?;
+                    let wrap = tishlang_ms_common::style::props_bool(&n.props, &["wrap", "wrapping"], false);
+                    let tl = self.text_layout(&n.text, &font(&n.props), f.w - pl - pr, wrap)?;
+                    let align = match tishlang_ms_common::style::props_string(&n.props, &["textAlign", "align", "textAlignment"]).as_deref() {
+                        Some("center") => DWRITE_TEXT_ALIGNMENT_CENTER,
+                        Some("right") | Some("end") => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                        _ => DWRITE_TEXT_ALIGNMENT_LEADING,
+                    };
+                    tl.SetTextAlignment(align)?;
+                    // Clipped to its frame (DRAW_TEXT_OPTIONS_CLIP), as a view's bounds.
+                    tl.SetMaxHeight(((f.h - pt) as f32).max(0.0))?;
+                    if !wrap {
+                        // Cut with "…" when it doesn't fit, as the Mac's labels.
+                        let tf = self.format(&font(&n.props))?;
+                        let sign = self.dw.CreateEllipsisTrimmingSign(&tf)?;
+                        tl.SetTrimming(&DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 }, &sign)?;
+                    }
                     let c = props_color(&n.props, &["color"]).unwrap_or_else(|| self.default_text());
                     let b = t.CreateSolidColorBrush(&color(c), None)?;
                     t.DrawTextLayout(Vector2 { X: (f.x + pl) as f32, Y: (f.y + pt) as f32 }, &tl, &b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -174,10 +209,13 @@ impl Renderer {
                 }
                 "image" if f.h > 1.0 => {
                     let s = f.h.min(f.w) as f32;
-                    let r = D2D_RECT_F { left: f.x as f32, top: f.y as f32, right: f.x as f32 + s, bottom: f.y as f32 + s };
+                    // Centred in its frame (an icon column is wider than the icon).
+                    let left = f.x as f32 + ((f.w as f32 - s) / 2.0).max(0.0);
+                    let r = D2D_RECT_F { left, top: f.y as f32, right: left + s, bottom: f.y as f32 + s };
                     let mut src = tishlang_ms_common::style::props_string(&n.props, &["src"]).unwrap_or_default();
                     // `symbol={true}`: `src` is an SF Symbol name, as tish-macos takes it.
-                    if tishlang_ms_common::style::props_bool(&n.props, &["symbol", "sfSymbol"], false) {
+                    // `symbol={true}`, or an AppKit named image ("NSActionTemplate").
+                    if tishlang_ms_common::style::props_bool(&n.props, &["symbol", "sfSymbol"], false) || (src.starts_with("NS") && !src.contains(':')) {
                         src = super::sys::symbols::glyph(&src).unwrap_or_default();
                     }
                     if let Some(text) = src.strip_prefix("glyph:").or_else(|| src.strip_prefix("label:")) {
@@ -188,14 +226,41 @@ impl Renderer {
                         let tl = self.symbol_layout(text, family, s * 0.78, s)?;
                         t.DrawTextLayout(Vector2 { X: r.left, Y: r.top }, &tl, &b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     } else {
+                    let tint = props_color(&n.props, &["tint"]);
+                    // Bitmaps keep their aspect ratio: fit in the frame's height, centred.
+                    let fit = |bmp: &ID2D1Bitmap| -> D2D_RECT_F {
+                        let sz = bmp.GetSize();
+                        if sz.width <= 0.0 || sz.height <= 0.0 {
+                            return r;
+                        }
+                        let hh = s.min(f.h as f32);
+                        let ww = (hh * sz.width / sz.height).min(f.w as f32);
+                        let hh = ww * sz.height / sz.width;
+                        let left = f.x as f32 + ((f.w as f32 - ww) / 2.0).max(0.0);
+                        let top = f.y as f32 + ((f.h as f32 - hh) / 2.0).max(0.0);
+                        D2D_RECT_F { left, top, right: left + ww, bottom: top + hh }
+                    };
                     match self.bitmap(t, &src, s) {
-                        Some(bmp) => t.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                        // A tinted image is a template: its alpha, filled with the tint.
+                        Some(bmp) if tint.is_some() && src.starts_with("image:") => {
+                            let b = t.CreateSolidColorBrush(&color(tint.unwrap_or(self.default_text())), None)?;
+                            t.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                            t.FillOpacityMask(&bmp, &b, D2D1_OPACITY_MASK_CONTENT_GRAPHICS, Some(&fit(&bmp)), None);
+                            t.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                        }
+                        Some(bmp) => t.DrawBitmap(&bmp, Some(&fit(&bmp)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
                         None => {
                             let b = t.CreateSolidColorBrush(&color(Rgba { r: 0.5, g: 0.5, b: 0.5, a: 0.35 }), None)?;
                             t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: s / 5.0, radiusY: s / 5.0 }, &b);
                         }
                     }
                     }
+                }
+                "textinput" => {
+                    let i = self.field_at.get();
+                    self.field_at.set(i + 1);
+                    let field = self.fields.borrow().get(i).cloned().unwrap_or_default();
+                    self.draw_field(t, n, &field)?;
                 }
                 _ => {}
             }
@@ -208,6 +273,55 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// A borderless text field, as tish-macos's `bezeled={false}`: the text (or placeholder) on the
+    /// panel, the selection, and a caret while focused. Scrolls to keep the caret in view.
+    fn draw_field(&self, t: &ID2D1HwndRenderTarget, n: &Node, field: &Field) -> Result<()> {
+        let f = n.frame;
+        let (pt, pr, pb, pl) = tishlang_ms_common::layout::padding(&n.props);
+        let fnt = font(&n.props);
+        let fg = props_color(&n.props, &["color"]).unwrap_or_else(|| self.default_text());
+        let empty = field.text.is_empty();
+        let shown = if empty { tishlang_ms_common::style::props_string(&n.props, &["placeholder"]).unwrap_or_default() } else { field.text.clone() };
+        let tl = self.text_layout(if shown.is_empty() { " " } else { &shown }, &fnt, 100_000.0, false)?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { tl.GetMetrics(&mut m)? };
+        let inner_w = (f.w - pl - pr).max(1.0) as f32;
+        let y = (f.y + pt) as f32 + (((f.h - pt - pb) as f32 - m.height) / 2.0).max(0.0);
+        let caret_x = |pos: u32| -> f32 {
+            if empty {
+                return 0.0;
+            }
+            let (mut x, mut yy) = (0.0f32, 0.0f32);
+            let mut hm = DWRITE_HIT_TEST_METRICS::default();
+            unsafe {
+                let _ = tl.HitTestTextPosition(pos, false, &mut x, &mut yy, &mut hm);
+            }
+            x
+        };
+        let cx = caret_x(field.sel.1);
+        let scroll = (cx - inner_w + 2.0).max(0.0);
+        let x0 = (f.x + pl) as f32 - scroll;
+        unsafe {
+            t.PushAxisAlignedClip(&D2D_RECT_F { left: (f.x + pl) as f32 - 1.0, top: f.y as f32, right: (f.x + f.w - pr) as f32 + 2.0, bottom: (f.y + f.h) as f32 }, D2D1_ANTIALIAS_MODE_ALIASED);
+            if field.focused && !empty && field.sel.0 != field.sel.1 {
+                let (a, b) = (caret_x(field.sel.0), cx);
+                let sel = Rgba { r: 0.35, g: 0.55, b: 1.0, a: 0.45 };
+                let br = t.CreateSolidColorBrush(&color(sel), None)?;
+                t.FillRectangle(&D2D_RECT_F { left: x0 + a.min(b), top: y, right: x0 + a.max(b), bottom: y + m.height }, &br);
+            }
+            let c = if empty { Rgba { a: fg.a * 0.45, ..fg } } else { fg };
+            let br = t.CreateSolidColorBrush(&color(c), None)?;
+            t.DrawTextLayout(Vector2 { X: x0, Y: y }, &tl, &br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            if field.focused {
+                let cc = props_color(&n.props, &["caretColor", "tint", "accentColor"]).unwrap_or(fg);
+                let br = t.CreateSolidColorBrush(&color(cc), None)?;
+                t.FillRectangle(&D2D_RECT_F { left: x0 + cx, top: y + 1.0, right: x0 + cx + 2.0, bottom: y + m.height - 1.0 }, &br);
+            }
+            t.PopAxisAlignedClip();
+        }
+        Ok(())
+    }
+
     /// The image for `src` at about `dip` DIPs (drawn at twice that for sharp high-DPI edges):
     /// `file:<path>` is the shell's icon for a file, folder, program or shortcut;
     /// `image:<path>` an image file (PNG, ICO, JPEG, …). None when it can't be loaded.

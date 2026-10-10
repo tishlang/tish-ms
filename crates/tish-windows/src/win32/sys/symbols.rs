@@ -7,6 +7,13 @@ pub(crate) fn glyph(name: &str) -> Option<String> {
         return Some(format!("label:{d}"));
     }
     let code: u32 = match name {
+        // AppKit's named images (NSImage(named:)), which tish-macos takes as `src` too.
+        "NSActionTemplate" => 0xE713,
+        "NSListViewTemplate" => 0xE8FD,
+        "NSMultipleDocuments" => 0xE8C8,
+        "NSStopProgressTemplate" => 0xE711,
+        "NSTrashEmpty" | "NSTrashFull" => 0xE74D,
+        "NSFolder" => 0xE8B7,
         "keyboard" | "keyboard.badge.ellipsis" => 0xE765,
         "doc.on.clipboard" | "clipboard" => 0xE77F,
         "exclamationmark.triangle" => 0xE7BA,

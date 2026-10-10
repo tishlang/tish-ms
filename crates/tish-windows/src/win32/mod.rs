@@ -22,12 +22,12 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-use windows::Win32::UI::Controls::{EM_SETCUEBANNER, EM_SETSEL, MARGINS};
+use windows::Win32::UI::Controls::{EM_GETSEL, EM_SETCUEBANNER, EM_SETSEL, MARGINS};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VIRTUAL_KEY};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use render::Renderer;
+use render::{Field, Renderer};
 
 const TIMER_ID: usize = 1;
 /// A resize that arrived while a commit held the app: lay out again once it's done.
@@ -69,6 +69,8 @@ thread_local! {
     static EDIT_PROCS: RefCell<HashMap<isize, isize>> = RefCell::new(HashMap::new());
     /// Kept outside `APP`: edit controls ask for colours while a commit holds `APP`.
     static DARK: Cell<bool> = const { Cell::new(true) };
+    /// A `borderless` window: no frame, the client area is the whole window.
+    static BORDERLESS: Cell<bool> = const { Cell::new(false) };
 }
 
 fn s(v: &str) -> Value {
@@ -219,7 +221,8 @@ fn sync_edits(app: &mut App) {
             }
         }
         unsafe {
-            let _ = MoveWindow(e.hwnd, (f.x * sc) as i32, (f.y * sc) as i32, (f.w * sc) as i32, (f.h * sc) as i32, true);
+            // Off-screen: the EDIT keeps focus, text and selection; the renderer draws the field.
+            let _ = MoveWindow(e.hwnd, -32000, (f.y * sc) as i32, (f.w * sc) as i32, (f.h * sc) as i32, false);
         }
         if let Some(v) = props_string(props, &["value"]) {
             if edit_text(e.hwnd) != v {
@@ -349,7 +352,28 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         return LRESULT(0);
     }
     let proc: WNDPROC = std::mem::transmute(old);
-    CallWindowProcW(proc, hwnd, msg, wp, lp)
+    let r = CallWindowProcW(proc, hwnd, msg, wp, lp);
+    if matches!(msg, WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SETFOCUS | WM_KILLFOCUS | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO | WM_SETTEXT | EM_SETSEL) {
+        if let Ok(parent) = GetParent(hwnd) {
+            let _ = InvalidateRect(Some(parent), None, false);
+        }
+    }
+    r
+}
+
+/// Each input's text, selection and focus, for the renderer.
+fn field_states(app: &App) -> Vec<Field> {
+    let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+    app.edits
+        .iter()
+        .map(|e| {
+            let (mut a, mut b) = (0u32, 0u32);
+            unsafe {
+                SendMessageW(e.hwnd, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
+            }
+            Field { text: edit_text(e.hwnd), sel: (a.min(b), a.max(b)), focused: focused == e.hwnd }
+        })
+        .collect()
 }
 
 // ── Window procedure ────────────────────────────────────────────────────────
@@ -384,7 +408,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     #[cfg(not(feature = "winui"))]
                     let island = false;
                     let drawn: &[Node] = if island { &[] } else { &app.roots };
-                    let _ = app.renderer.paint(hwnd, dpi, drawn);
+                    let fields = field_states(app);
+                    let _ = app.renderer.paint(hwnd, dpi, drawn, fields);
                     app.stats.last_paint_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     if !app.painted {
                         app.painted = true;
@@ -417,9 +442,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_RELAYOUT => SendMessageW(hwnd, WM_SIZE, Some(WPARAM(0)), Some(lp)),
+        // Borderless: WS_THICKFRAME keeps DWM's shadow and rounded corners; no frame is drawn.
+        WM_NCCALCSIZE if wp.0 != 0 && BORDERLESS.with(|b| b.get()) => LRESULT(0),
         WM_DPICHANGED => {
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let sc = dpi_scale(hwnd);
+            let (x, y) = ((lp.0 & 0xffff) as i16 as f64 / sc, ((lp.0 >> 16) & 0xffff) as i16 as f64 / sc);
+            let edit = APP.with(|a| {
+                let a = a.try_borrow().ok()?;
+                let app = a.as_ref()?;
+                let i = inputs(&app.roots).iter().position(|n| {
+                    let f = n.frame;
+                    x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h
+                })?;
+                app.edits.get(i).map(|e| e.hwnd)
+            });
+            if let Some(e) = edit {
+                let _ = SetFocus(Some(e));
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -530,6 +575,7 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         RegisterClassW(&wc);
         let title = wide(&props_string(o, &["title"]).unwrap_or_else(|| "Tish".into()));
         let borderless = props_bool(o, &["borderless"], false);
+        BORDERLESS.with(|b| b.set(borderless));
         let style = if borderless { WS_POPUP | WS_THICKFRAME } else { WS_OVERLAPPEDWINDOW };
         // A launcher panel: no taskbar button, above other windows.
         let mut ex = WINDOW_EX_STYLE::default();
@@ -555,9 +601,16 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         )?;
         let sc = dpi_scale(hwnd);
         let (w, h) = (props_f64(o, &["width"], 640.0), props_f64(o, &["height"], 420.0));
-        let (sw, shh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let (pw, ph) = ((w * sc) as i32, (h * sc) as i32);
-        let _ = SetWindowPos(hwnd, None, (sw - pw) / 2, (shh - ph) / 4, pw, ph, SWP_NOZORDER | SWP_FRAMECHANGED);
+        // Centred across, a fifth of the way down the screen's usable area (as the Mac panel's top
+        // edge at 80% of the screen's height), leaving room to grow.
+        let work = work_area(hwnd);
+        let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+        let _ = SetWindowPos(hwnd, None, work.left + (ww - pw) / 2, work.top + wh / 5, pw, ph, SWP_NOZORDER | SWP_FRAMECHANGED);
+        let (fw, fh) = frame_extra(hwnd);
+        if fw != 0 || fh != 0 {
+            let _ = SetWindowPos(hwnd, None, 0, 0, pw + fw, ph + fh, SWP_NOZORDER | SWP_NOMOVE);
+        }
 
         let dark = props_bool(o, &["dark"], true);
         let on: windows::core::BOOL = dark.into();
@@ -566,6 +619,14 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
         let backdrop = backdrop_type(&props_string(o, &["backdrop"]).unwrap_or_default());
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
+        // A hairline edge, as the Mac panel's (DWM takes an opaque colour).
+        if let Some(e) = props_string(o, &["edge"]).and_then(|s| tishlang_ms_common::style::parse_color(&s)) {
+            // Its alpha over the panel (dark or light), as DWM draws the border opaque.
+            let base = if props_bool(o, &["dark"], true) { 0.1f32 } else { 0.96 };
+            let mix = |v: f32| (((v * e.a + base * (1.0 - e.a)) * 255.0).round() as u32).min(255);
+            let c = COLORREF(mix(e.b) << 16 | mix(e.g) << 8 | mix(e.r));
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &c as *const _ as _, 4);
+        }
         // Let the backdrop show through the whole client area.
         let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
         SetTimer(Some(hwnd), TIMER_ID, 16, None);
@@ -619,8 +680,23 @@ fn run(args: &[Value]) -> Value {
     };
     let dark = props_bool(&o, &["dark"], true);
     DARK.with(|d| d.set(dark));
+    tishlang_ms_common::style::set_dark(dark);
+    // The user's accent colour (Settings > Personalization > Colors), for `controlAccent`.
+    unsafe {
+        let (mut argb, mut opaque) = (0u32, windows::core::BOOL::default());
+        if DwmGetColorizationColor(&mut argb, &mut opaque).is_ok() {
+            tishlang_ms_common::style::set_accent(argb & 0x00FF_FFFF);
+        }
+    }
     let renderer = match Renderer::new(dark) {
-        Ok(r) => r,
+        Ok(mut r) => {
+            // `tint` / `tintLight`: drawn over the backdrop, as the Mac panel's tint over its blur.
+            let c = |k: &str| props_string(&o, &[k]).and_then(|s| tishlang_ms_common::style::parse_color(&s));
+            if let Some(d) = c("tint") {
+                r.tint = Some((d, c("tintLight").unwrap_or(d)));
+            }
+            r
+        }
         Err(e) => {
             eprintln!("tish-windows: Direct2D is unavailable: {e}");
             return Value::Null;
@@ -734,16 +810,41 @@ fn win_toggle(a: &[Value]) -> Value {
 }
 
 /// `setSize(w, h)` in DIPs, keeping the window's top edge and horizontal centre.
+/// How much bigger the window is than its client area (the frame DWM keeps for the border and
+/// rounded corners), so a size asked for is the content's.
+fn frame_extra(h: HWND) -> (i32, i32) {
+    unsafe {
+        let (mut w, mut c) = (RECT::default(), RECT::default());
+        let _ = GetWindowRect(h, &mut w);
+        let _ = GetClientRect(h, &mut c);
+        ((w.right - w.left) - (c.right - c.left), (w.bottom - w.top) - (c.bottom - c.top))
+    }
+}
+
+/// The usable part (without the taskbar) of the monitor `h` is on.
+fn work_area(h: HWND) -> RECT {
+    unsafe {
+        let m = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(m, &mut mi);
+        mi.rcWork
+    }
+}
+
 fn win_set_size(args: &[Value]) -> Value {
     let Some(h) = app_hwnd() else { return Value::Null };
     let num = |i: usize| args.get(i).and_then(|v| v.as_number()).unwrap_or(0.0);
     let sc = dpi_scale(h);
-    let (w, ht) = ((num(0) * sc) as i32, (num(1) * sc) as i32);
+    let (fw, fh) = frame_extra(h);
+    let (w, ht) = ((num(0) * sc) as i32 + fw, (num(1) * sc) as i32 + fh);
     unsafe {
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
         let cx = (r.left + r.right) / 2;
-        let _ = SetWindowPos(h, None, cx - w / 2, r.top, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
+        // Grow down from the same top edge, but never under the taskbar.
+        let work = work_area(h);
+        let top = r.top.min(work.bottom - ht).max(work.top);
+        let _ = SetWindowPos(h, None, cx - w / 2, top, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     Value::Null
 }
