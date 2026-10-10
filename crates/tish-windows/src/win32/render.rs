@@ -277,7 +277,8 @@ impl Renderer {
                     let b = t.CreateSolidColorBrush(&color(c), None)?;
                     t.FillRectangle(&rect(Rect { h: 1.0, ..f }), &b);
                 }
-                "image" if f.h > 1.0 => {
+                // No source draws nothing (Moo's collapsed buttons are 1 px images without one).
+                "image" if f.h > 1.0 && f.w > 1.0 && tishlang_ms_common::style::props_string(&n.props, &["src"]).is_some_and(|s| !s.is_empty()) => {
                     let s = f.h.min(f.w) as f32;
                     // Centred in its frame (an icon column is wider than the icon).
                     let left = f.x as f32 + ((f.w as f32 - s) / 2.0).max(0.0);

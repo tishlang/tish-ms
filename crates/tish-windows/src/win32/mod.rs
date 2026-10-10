@@ -582,7 +582,10 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         let title = wide(&props_string(o, &["title"]).unwrap_or_else(|| "Tish".into()));
         let borderless = props_bool(o, &["borderless"], false);
         BORDERLESS.with(|b| b.set(borderless));
-        let style = if borderless { WS_POPUP | WS_THICKFRAME } else { WS_OVERLAPPEDWINDOW };
+        // A window that rounds itself (`radius`) is a plain popup: no frame for DWM to draw a
+        // square sheet or shadow around its rounded shape.
+        let own_shape = props_f64(o, &["radius", "cornerRadius"], 0.0) > 0.0;
+        let style = if borderless && own_shape { WS_POPUP } else if borderless { WS_POPUP | WS_THICKFRAME } else { WS_OVERLAPPEDWINDOW };
         // A launcher panel: no taskbar button, above other windows.
         let mut ex = WINDOW_EX_STYLE::default();
         if props_bool(o, &["toolWindow"], false) {
@@ -624,7 +627,7 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         let own = props_f64(o, &["radius", "cornerRadius"], 0.0) > 0.0;
         let corner = if own { DWMWCP_DONOTROUND } else { DWMWCP_ROUND };
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
-        let backdrop = backdrop_type(&props_string(o, &["backdrop"]).unwrap_or_default());
+        let backdrop = if own { DWMSBT_NONE } else { backdrop_type(&props_string(o, &["backdrop"]).unwrap_or_default()) };
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
         // A hairline edge, as the Mac panel's (DWM takes an opaque colour).
         if own {
@@ -637,8 +640,14 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
             let c = COLORREF(mix(e.b) << 16 | mix(e.g) << 8 | mix(e.r));
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &c as *const _ as _, 4);
         }
-        // Let the backdrop show through the whole client area.
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+        if own {
+            // It draws its own backdrop: nothing of DWM's behind or around it.
+            let off = DWMNCRP_DISABLED;
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &off as *const _ as _, 4);
+        } else {
+            // Let the backdrop show through the whole client area.
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+        }
         SetTimer(Some(hwnd), TIMER_ID, 16, None);
         Ok(hwnd)
     }
