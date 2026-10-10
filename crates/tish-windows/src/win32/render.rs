@@ -31,6 +31,51 @@ pub struct Renderer {
     bitmaps: RefCell<HashMap<(String, u32), ID2D1Bitmap>>,
     wic: Option<IWICImagingFactory>,
     pub dark: bool,
+    /// Drawn over the backdrop before everything else (the panel's tint), by dark mode.
+    pub tint: Option<(Rgba, Rgba)>,
+    /// Over the tint: how much the panel dims what is behind it (the Mac glass's scrim).
+    pub scrim: Option<(Rgba, Rgba)>,
+    /// The window's corner radius (DIPs) and the hairline drawn along its edge.
+    pub radius: f32,
+    pub edge: Option<(Rgba, Rgba)>,
+    /// What is behind the window, blurred: drawn first, so the panel reads as frosted glass on
+    /// any machine (DWM's acrylic needs a GPU).
+    backdrop: Option<Backdrop>,
+    backdrop_bitmap: RefCell<Option<ID2D1Bitmap>>,
+    /// A layered window's drawing surface: a DC render target on a 32-bit DIB, with alpha.
+    layered: Option<Layered>,
+    /// The text inputs' state (their EDIT controls are kept off-screen; the field is drawn here).
+    fields: RefCell<Vec<Field>>,
+    field_at: std::cell::Cell<usize>,
+}
+
+/// A per-pixel-alpha window's surface (UpdateLayeredWindow): anti-aliased corners and a shadow.
+struct Layered {
+    target: ID2D1DCRenderTarget,
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    dib: windows::Win32::Graphics::Gdi::HBITMAP,
+    old: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    w: i32,
+    h: i32,
+}
+
+/// The screen behind the window, blurred, at a fraction of its pixel size.
+pub struct Backdrop {
+    /// Premultiplied BGRA, `w` × `h`, opaque.
+    pub pixels: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    /// The screen rectangle it covers, in physical pixels.
+    pub screen: RECT,
+}
+
+/// One `textinput`'s text and selection, in tree order.
+#[derive(Clone, Default)]
+pub struct Field {
+    pub text: String,
+    /// UTF-16 offsets, start <= end.
+    pub sel: (u32, u32),
+    pub focused: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -51,7 +96,7 @@ impl Renderer {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
-            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark })
+            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, scrim: None, radius: 0.0, edge: None, backdrop: None, backdrop_bitmap: RefCell::new(None), layered: None, fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
         }
     }
 
@@ -111,6 +156,37 @@ impl Renderer {
         Ok(t)
     }
 
+    pub fn set_backdrop(&mut self, b: Option<Backdrop>) {
+        self.backdrop = b;
+        *self.backdrop_bitmap.borrow_mut() = None;
+    }
+
+    /// The blurred backdrop, scaled up over the part of the screen the window covers.
+    fn draw_backdrop(&self, t: &ID2D1RenderTarget, hwnd: HWND, dpi: f32, margin: f32) -> Result<()> {
+        let Some(b) = &self.backdrop else { return Ok(()) };
+        if self.backdrop_bitmap.borrow().is_none() {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let bmp = unsafe { t.CreateBitmap(D2D_SIZE_U { width: b.w, height: b.h }, Some(b.pixels.as_ptr() as _), b.w * 4, &props)? };
+            *self.backdrop_bitmap.borrow_mut() = Some(bmp);
+        }
+        let Some(bmp) = self.backdrop_bitmap.borrow().clone() else { return Ok(()) };
+        let mut win = RECT::default();
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut win)? };
+        let sc = dpi / 96.0;
+        let dest = D2D_RECT_F {
+            left: (b.screen.left - win.left) as f32 / sc - margin,
+            top: (b.screen.top - win.top) as f32 / sc - margin,
+            right: (b.screen.right - win.left) as f32 / sc - margin,
+            bottom: (b.screen.bottom - win.top) as f32 / sc - margin,
+        };
+        unsafe { t.DrawBitmap(&bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        Ok(())
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         if let Some(t) = &self.target {
             unsafe {
@@ -127,18 +203,44 @@ impl Renderer {
         }
     }
 
-    pub fn paint(&mut self, hwnd: HWND, dpi: f32, roots: &[Node]) -> Result<()> {
+    pub fn paint(&mut self, hwnd: HWND, dpi: f32, roots: &[Node], fields: Vec<Field>) -> Result<()> {
         let t = self.ensure_target(hwnd, dpi)?;
+        *self.fields.borrow_mut() = fields;
+        self.field_at.set(0);
+        let clear = match self.tint {
+            Some((dark, light)) => color(if self.dark { dark } else { light }),
+            None => D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        };
+        let pick = |c: Option<(Rgba, Rgba)>| c.map(|(d, l)| if self.dark { d } else { l });
         unsafe {
             t.BeginDraw();
-            t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            if self.backdrop.is_some() {
+                t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
+                self.draw_backdrop(&t.cast()?, hwnd, dpi, 0.0)?;
+                let size = t.GetSize();
+                let all = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
+                for c in [pick(self.tint), pick(self.scrim)].into_iter().flatten() {
+                    let b = t.CreateSolidColorBrush(&color(c), None)?;
+                    t.FillRectangle(&all, &b);
+                }
+            } else {
+                t.Clear(Some(&clear));
+            }
             for n in roots {
-                self.draw(&t, n)?;
+                self.draw(&t.cast()?, n)?;
+            }
+            if let Some(e) = pick(self.edge) {
+                // The hairline just inside the window's rounded edge.
+                let size = t.GetSize();
+                let b = t.CreateSolidColorBrush(&color(e), None)?;
+                let r = D2D_RECT_F { left: 0.5, top: 0.5, right: size.width - 0.5, bottom: size.height - 0.5 };
+                t.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: self.radius, radiusY: self.radius }, &b, 1.0, None);
             }
             if let Err(e) = t.EndDraw(None, None) {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.target = None;
                     self.bitmaps.borrow_mut().clear();
+                    *self.backdrop_bitmap.borrow_mut() = None;
                 } else {
                     return Err(e);
                 }
@@ -147,7 +249,129 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw(&self, t: &ID2D1HwndRenderTarget, n: &Node) -> Result<()> {
+    /// Paint a layered window: the content `w` × `h` DIPs at `margin` from the window's edges,
+    /// clipped to its rounded rectangle (anti-aliased), over a soft shadow in the margin; then
+    /// hand the pixels to DWM with UpdateLayeredWindow.
+    pub fn paint_layered(&mut self, hwnd: HWND, dpi: f32, roots: &[Node], fields: Vec<Field>, margin: f32) -> Result<()> {
+        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
+        let mut win = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut win)? };
+        let (pw, ph) = (win.right - win.left, win.bottom - win.top);
+        if pw <= 0 || ph <= 0 {
+            return Ok(());
+        }
+        if self.layered.as_ref().is_none_or(|l| l.w != pw || l.h != ph) {
+            self.drop_layered();
+            unsafe {
+                let dc = CreateCompatibleDC(None);
+                let bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: pw, biHeight: -ph, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let dib = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+                let old = SelectObject(dc, dib.into());
+                let props = D2D1_RENDER_TARGET_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                    dpiX: dpi,
+                    dpiY: dpi,
+                    ..Default::default()
+                };
+                let target = self.d2d.CreateDCRenderTarget(&props)?;
+                target.BindDC(dc, &RECT { left: 0, top: 0, right: pw, bottom: ph })?;
+                // ClearType needs an opaque background; on alpha it fringes.
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                self.bitmaps.borrow_mut().clear();
+                *self.backdrop_bitmap.borrow_mut() = None;
+                self.layered = Some(Layered { target, dc, dib, old, w: pw, h: ph });
+            }
+        }
+        let Some(l) = &self.layered else { return Ok(()) };
+        let t: ID2D1RenderTarget = l.target.cast()?;
+        *self.fields.borrow_mut() = fields;
+        self.field_at.set(0);
+        let pick = |c: Option<(Rgba, Rgba)>| c.map(|(d, l)| if self.dark { d } else { l });
+        let size = unsafe { t.GetSize() };
+        let body = D2D_RECT_F { left: margin, top: margin, right: size.width - margin, bottom: size.height - margin };
+        let r = self.radius;
+        unsafe {
+            t.BeginDraw();
+            t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            // The shadow: rounded rectangles growing into the margin, each fainter, offset down.
+            let steps = (margin / 2.0).floor() as i32;
+            for i in (1..=steps).rev() {
+                let d = i as f32 * 2.0;
+                let a = 0.10 * (1.0 - i as f32 / (steps as f32 + 1.0)).powi(2);
+                let b = t.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a }, None)?;
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F { left: body.left - d * 0.6, top: body.top - d * 0.4, right: body.right + d * 0.6, bottom: body.bottom + d * 0.9 },
+                    radiusX: r + d * 0.6,
+                    radiusY: r + d * 0.6,
+                };
+                t.FillRoundedRectangle(&rr, &b);
+            }
+            // Everything else inside the rounded body, anti-aliased at the corners.
+            let shape = self.d2d.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect: body, radiusX: r, radiusY: r })?;
+            let layer = t.CreateLayer(None)?;
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: D2D_RECT_F { left: f32::MIN, top: f32::MIN, right: f32::MAX, bottom: f32::MAX },
+                geometricMask: std::mem::ManuallyDrop::new(Some(shape.cast()?)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: windows_numerics::Matrix3x2::identity(),
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            t.PushLayer(&params, &layer);
+            t.SetTransform(&windows_numerics::Matrix3x2::translation(margin, margin));
+            let inner = D2D_RECT_F { left: 0.0, top: 0.0, right: body.right - body.left, bottom: body.bottom - body.top };
+            if self.backdrop.is_some() {
+                let b = t.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, None)?;
+                t.FillRectangle(&inner, &b);
+                self.draw_backdrop(&t, hwnd, dpi, margin)?;
+            }
+            for c in [pick(self.tint), pick(self.scrim)].into_iter().flatten() {
+                let b = t.CreateSolidColorBrush(&color(c), None)?;
+                t.FillRectangle(&inner, &b);
+            }
+            for n in roots {
+                self.draw(&t, n)?;
+            }
+            t.SetTransform(&windows_numerics::Matrix3x2::identity());
+            t.PopLayer();
+            if let Some(e) = pick(self.edge) {
+                let b = t.CreateSolidColorBrush(&color(e), None)?;
+                let er = D2D_RECT_F { left: body.left + 0.5, top: body.top + 0.5, right: body.right - 0.5, bottom: body.bottom - 0.5 };
+                t.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: er, radiusX: r, radiusY: r }, &b, 1.0, None);
+            }
+            if let Err(e) = t.EndDraw(None, None) {
+                if e.code() == D2DERR_RECREATE_TARGET {
+                    self.drop_layered();
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let pos = windows::Win32::Foundation::POINT { x: win.left, y: win.top };
+            let sz = windows::Win32::Foundation::SIZE { cx: pw, cy: ph };
+            let src = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+            UpdateLayeredWindow(hwnd, None, Some(&pos), Some(&sz), Some(l.dc), Some(&src), windows::Win32::Foundation::COLORREF(0), Some(&blend), ULW_ALPHA)?;
+        }
+        Ok(())
+    }
+
+    fn drop_layered(&mut self) {
+        if let Some(l) = self.layered.take() {
+            unsafe {
+                windows::Win32::Graphics::Gdi::SelectObject(l.dc, l.old);
+                let _ = DeleteObject(l.dib.into());
+                let _ = windows::Win32::Graphics::Gdi::DeleteDC(l.dc);
+            }
+        }
+    }
+
+    fn draw(&self, t: &ID2D1RenderTarget, n: &Node) -> Result<()> {
         let f = n.frame;
         unsafe {
             if let Some(bg) = props_color(&n.props, &["backgroundColor", "background"]).filter(|c| c.a > 0.0) {
@@ -162,7 +386,22 @@ impl Renderer {
             match n.tag.as_str() {
                 "text" | "button" if !n.text.is_empty() => {
                     let (pt, pr, _, pl) = tishlang_ms_common::layout::padding(&n.props);
-                    let tl = self.text_layout(&n.text, &font(&n.props), f.w - pl - pr, true)?;
+                    let wrap = tishlang_ms_common::style::props_bool(&n.props, &["wrap", "wrapping"], false);
+                    let tl = self.text_layout(&n.text, &font(&n.props), f.w - pl - pr, wrap)?;
+                    let align = match tishlang_ms_common::style::props_string(&n.props, &["textAlign", "align", "textAlignment"]).as_deref() {
+                        Some("center") => DWRITE_TEXT_ALIGNMENT_CENTER,
+                        Some("right") | Some("end") => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                        _ => DWRITE_TEXT_ALIGNMENT_LEADING,
+                    };
+                    tl.SetTextAlignment(align)?;
+                    // Clipped to its frame (DRAW_TEXT_OPTIONS_CLIP), as a view's bounds.
+                    tl.SetMaxHeight(((f.h - pt) as f32).max(0.0))?;
+                    if !wrap {
+                        // Cut with "…" when it doesn't fit, as the Mac's labels.
+                        let tf = self.format(&font(&n.props))?;
+                        let sign = self.dw.CreateEllipsisTrimmingSign(&tf)?;
+                        tl.SetTrimming(&DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 }, &sign)?;
+                    }
                     let c = props_color(&n.props, &["color"]).unwrap_or_else(|| self.default_text());
                     let b = t.CreateSolidColorBrush(&color(c), None)?;
                     t.DrawTextLayout(Vector2 { X: (f.x + pl) as f32, Y: (f.y + pt) as f32 }, &tl, &b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -172,12 +411,16 @@ impl Renderer {
                     let b = t.CreateSolidColorBrush(&color(c), None)?;
                     t.FillRectangle(&rect(Rect { h: 1.0, ..f }), &b);
                 }
-                "image" if f.h > 1.0 => {
+                // No source draws nothing (Moo's collapsed buttons are 1 px images without one).
+                "image" if f.h > 1.0 && f.w > 1.0 && tishlang_ms_common::style::props_string(&n.props, &["src"]).is_some_and(|s| !s.is_empty()) => {
                     let s = f.h.min(f.w) as f32;
-                    let r = D2D_RECT_F { left: f.x as f32, top: f.y as f32, right: f.x as f32 + s, bottom: f.y as f32 + s };
+                    // Centred in its frame (an icon column is wider than the icon).
+                    let left = f.x as f32 + ((f.w as f32 - s) / 2.0).max(0.0);
+                    let r = D2D_RECT_F { left, top: f.y as f32, right: left + s, bottom: f.y as f32 + s };
                     let mut src = tishlang_ms_common::style::props_string(&n.props, &["src"]).unwrap_or_default();
                     // `symbol={true}`: `src` is an SF Symbol name, as tish-macos takes it.
-                    if tishlang_ms_common::style::props_bool(&n.props, &["symbol", "sfSymbol"], false) {
+                    // `symbol={true}`, or an AppKit named image ("NSActionTemplate").
+                    if tishlang_ms_common::style::props_bool(&n.props, &["symbol", "sfSymbol"], false) || (src.starts_with("NS") && !src.contains(':')) {
                         src = super::sys::symbols::glyph(&src).unwrap_or_default();
                     }
                     if let Some(text) = src.strip_prefix("glyph:").or_else(|| src.strip_prefix("label:")) {
@@ -188,14 +431,41 @@ impl Renderer {
                         let tl = self.symbol_layout(text, family, s * 0.78, s)?;
                         t.DrawTextLayout(Vector2 { X: r.left, Y: r.top }, &tl, &b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     } else {
+                    let tint = props_color(&n.props, &["tint"]);
+                    // Bitmaps keep their aspect ratio: fit in the frame's height, centred.
+                    let fit = |bmp: &ID2D1Bitmap| -> D2D_RECT_F {
+                        let sz = bmp.GetSize();
+                        if sz.width <= 0.0 || sz.height <= 0.0 {
+                            return r;
+                        }
+                        let hh = s.min(f.h as f32);
+                        let ww = (hh * sz.width / sz.height).min(f.w as f32);
+                        let hh = ww * sz.height / sz.width;
+                        let left = f.x as f32 + ((f.w as f32 - ww) / 2.0).max(0.0);
+                        let top = f.y as f32 + ((f.h as f32 - hh) / 2.0).max(0.0);
+                        D2D_RECT_F { left, top, right: left + ww, bottom: top + hh }
+                    };
                     match self.bitmap(t, &src, s) {
-                        Some(bmp) => t.DrawBitmap(&bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                        // A tinted image is a template: its alpha, filled with the tint.
+                        Some(bmp) if tint.is_some() && src.starts_with("image:") => {
+                            let b = t.CreateSolidColorBrush(&color(tint.unwrap_or(self.default_text())), None)?;
+                            t.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                            t.FillOpacityMask(&bmp, &b, D2D1_OPACITY_MASK_CONTENT_GRAPHICS, Some(&fit(&bmp)), None);
+                            t.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                        }
+                        Some(bmp) => t.DrawBitmap(&bmp, Some(&fit(&bmp)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
                         None => {
                             let b = t.CreateSolidColorBrush(&color(Rgba { r: 0.5, g: 0.5, b: 0.5, a: 0.35 }), None)?;
                             t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: s / 5.0, radiusY: s / 5.0 }, &b);
                         }
                     }
                     }
+                }
+                "textinput" => {
+                    let i = self.field_at.get();
+                    self.field_at.set(i + 1);
+                    let field = self.fields.borrow().get(i).cloned().unwrap_or_default();
+                    self.draw_field(t, n, &field)?;
                 }
                 _ => {}
             }
@@ -208,10 +478,59 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// A borderless text field, as tish-macos's `bezeled={false}`: the text (or placeholder) on the
+    /// panel, the selection, and a caret while focused. Scrolls to keep the caret in view.
+    fn draw_field(&self, t: &ID2D1RenderTarget, n: &Node, field: &Field) -> Result<()> {
+        let f = n.frame;
+        let (pt, pr, pb, pl) = tishlang_ms_common::layout::padding(&n.props);
+        let fnt = font(&n.props);
+        let fg = props_color(&n.props, &["color"]).unwrap_or_else(|| self.default_text());
+        let empty = field.text.is_empty();
+        let shown = if empty { tishlang_ms_common::style::props_string(&n.props, &["placeholder"]).unwrap_or_default() } else { field.text.clone() };
+        let tl = self.text_layout(if shown.is_empty() { " " } else { &shown }, &fnt, 100_000.0, false)?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { tl.GetMetrics(&mut m)? };
+        let inner_w = (f.w - pl - pr).max(1.0) as f32;
+        let y = (f.y + pt) as f32 + (((f.h - pt - pb) as f32 - m.height) / 2.0).max(0.0);
+        let caret_x = |pos: u32| -> f32 {
+            if empty {
+                return 0.0;
+            }
+            let (mut x, mut yy) = (0.0f32, 0.0f32);
+            let mut hm = DWRITE_HIT_TEST_METRICS::default();
+            unsafe {
+                let _ = tl.HitTestTextPosition(pos, false, &mut x, &mut yy, &mut hm);
+            }
+            x
+        };
+        let cx = caret_x(field.sel.1);
+        let scroll = (cx - inner_w + 2.0).max(0.0);
+        let x0 = (f.x + pl) as f32 - scroll;
+        unsafe {
+            t.PushAxisAlignedClip(&D2D_RECT_F { left: (f.x + pl) as f32 - 1.0, top: f.y as f32, right: (f.x + f.w - pr) as f32 + 2.0, bottom: (f.y + f.h) as f32 }, D2D1_ANTIALIAS_MODE_ALIASED);
+            if field.focused && !empty && field.sel.0 != field.sel.1 {
+                let (a, b) = (caret_x(field.sel.0), cx);
+                let sel = Rgba { r: 0.35, g: 0.55, b: 1.0, a: 0.45 };
+                let br = t.CreateSolidColorBrush(&color(sel), None)?;
+                t.FillRectangle(&D2D_RECT_F { left: x0 + a.min(b), top: y, right: x0 + a.max(b), bottom: y + m.height }, &br);
+            }
+            let c = if empty { Rgba { a: fg.a * 0.45, ..fg } } else { fg };
+            let br = t.CreateSolidColorBrush(&color(c), None)?;
+            t.DrawTextLayout(Vector2 { X: x0, Y: y }, &tl, &br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            if field.focused {
+                let cc = props_color(&n.props, &["caretColor", "tint", "accentColor"]).unwrap_or(fg);
+                let br = t.CreateSolidColorBrush(&color(cc), None)?;
+                t.FillRectangle(&D2D_RECT_F { left: x0 + cx, top: y + 1.0, right: x0 + cx + 2.0, bottom: y + m.height - 1.0 }, &br);
+            }
+            t.PopAxisAlignedClip();
+        }
+        Ok(())
+    }
+
     /// The image for `src` at about `dip` DIPs (drawn at twice that for sharp high-DPI edges):
     /// `file:<path>` is the shell's icon for a file, folder, program or shortcut;
     /// `image:<path>` an image file (PNG, ICO, JPEG, …). None when it can't be loaded.
-    fn bitmap(&self, t: &ID2D1HwndRenderTarget, src: &str, dip: f32) -> Option<ID2D1Bitmap> {
+    fn bitmap(&self, t: &ID2D1RenderTarget, src: &str, dip: f32) -> Option<ID2D1Bitmap> {
         if src.is_empty() {
             return None;
         }

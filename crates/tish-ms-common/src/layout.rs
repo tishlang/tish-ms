@@ -160,7 +160,7 @@ pub fn layout(node: &mut Node, x: f64, y: f64, w: f64, m: &dyn Measure) -> f64 {
                 cx += cw;
             }
             let tallest = heights.iter().cloned().fold(0.0, f64::max);
-            let inner = tallest.max(min_h - pt - pb);
+            let inner = if min_h > 0.0 { (min_h - pt - pb).max(0.0) } else { tallest };
             let align = cross_align(&node.props);
             if align != Align::Start {
                 for (c, h) in node.children.iter_mut().zip(&heights) {
@@ -181,7 +181,8 @@ pub fn layout(node: &mut Node, x: f64, y: f64, w: f64, m: &dyn Measure) -> f64 {
             tallest
         }
         "text" | "button" => {
-            let wrap = !matches!(node.props.get("wrap"), Some(Value::Bool(false)));
+            // Single-line unless `wrap`, as tish-macos labels.
+            let wrap = matches!(node.props.get("wrap").or_else(|| node.props.get("wrapping")), Some(Value::Bool(true)));
             let (_, th) = m.text(&node.text, &font(&node.props), iw, wrap);
             th
         }
@@ -190,7 +191,9 @@ pub fn layout(node: &mut Node, x: f64, y: f64, w: f64, m: &dyn Measure) -> f64 {
         "rule" => props_f64(&node.props, &["height", "h"], 1.0),
         _ => props_f64(&node.props, &["height", "h"], 0.0),
     };
-    let h = (pt + content_h + pb).max(min_h);
+    // A set height is the node's height, as tish-macos's frames (Moo's 1 px filler rows hold text
+    // that would otherwise grow them); 0 or none fits the content.
+    let h = if min_h > 0.0 { min_h } else { pt + content_h + pb };
     node.frame = Rect { x, y, w, h };
     h
 }
