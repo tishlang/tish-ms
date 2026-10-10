@@ -42,9 +42,21 @@ pub struct Renderer {
     /// any machine (DWM's acrylic needs a GPU).
     backdrop: Option<Backdrop>,
     backdrop_bitmap: RefCell<Option<ID2D1Bitmap>>,
+    /// A layered window's drawing surface: a DC render target on a 32-bit DIB, with alpha.
+    layered: Option<Layered>,
     /// The text inputs' state (their EDIT controls are kept off-screen; the field is drawn here).
     fields: RefCell<Vec<Field>>,
     field_at: std::cell::Cell<usize>,
+}
+
+/// A per-pixel-alpha window's surface (UpdateLayeredWindow): anti-aliased corners and a shadow.
+struct Layered {
+    target: ID2D1DCRenderTarget,
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    dib: windows::Win32::Graphics::Gdi::HBITMAP,
+    old: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    w: i32,
+    h: i32,
 }
 
 /// The screen behind the window, blurred, at a fraction of its pixel size.
@@ -84,7 +96,7 @@ impl Renderer {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
-            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, scrim: None, radius: 0.0, edge: None, backdrop: None, backdrop_bitmap: RefCell::new(None), fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
+            Ok(Self { d2d, dw, target: None, formats: RefCell::new(HashMap::new()), images: RefCell::new(HashMap::new()), bitmaps: RefCell::new(HashMap::new()), wic, dark, tint: None, scrim: None, radius: 0.0, edge: None, backdrop: None, backdrop_bitmap: RefCell::new(None), layered: None, fields: RefCell::new(Vec::new()), field_at: std::cell::Cell::new(0) })
         }
     }
 
@@ -150,7 +162,7 @@ impl Renderer {
     }
 
     /// The blurred backdrop, scaled up over the part of the screen the window covers.
-    fn draw_backdrop(&self, t: &ID2D1HwndRenderTarget, hwnd: HWND, dpi: f32) -> Result<()> {
+    fn draw_backdrop(&self, t: &ID2D1RenderTarget, hwnd: HWND, dpi: f32, margin: f32) -> Result<()> {
         let Some(b) = &self.backdrop else { return Ok(()) };
         if self.backdrop_bitmap.borrow().is_none() {
             let props = D2D1_BITMAP_PROPERTIES {
@@ -166,10 +178,10 @@ impl Renderer {
         unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut win)? };
         let sc = dpi / 96.0;
         let dest = D2D_RECT_F {
-            left: (b.screen.left - win.left) as f32 / sc,
-            top: (b.screen.top - win.top) as f32 / sc,
-            right: (b.screen.right - win.left) as f32 / sc,
-            bottom: (b.screen.bottom - win.top) as f32 / sc,
+            left: (b.screen.left - win.left) as f32 / sc - margin,
+            top: (b.screen.top - win.top) as f32 / sc - margin,
+            right: (b.screen.right - win.left) as f32 / sc - margin,
+            bottom: (b.screen.bottom - win.top) as f32 / sc - margin,
         };
         unsafe { t.DrawBitmap(&bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
         Ok(())
@@ -204,7 +216,7 @@ impl Renderer {
             t.BeginDraw();
             if self.backdrop.is_some() {
                 t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
-                self.draw_backdrop(&t, hwnd, dpi)?;
+                self.draw_backdrop(&t.cast()?, hwnd, dpi, 0.0)?;
                 let size = t.GetSize();
                 let all = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
                 for c in [pick(self.tint), pick(self.scrim)].into_iter().flatten() {
@@ -215,7 +227,7 @@ impl Renderer {
                 t.Clear(Some(&clear));
             }
             for n in roots {
-                self.draw(&t, n)?;
+                self.draw(&t.cast()?, n)?;
             }
             if let Some(e) = pick(self.edge) {
                 // The hairline just inside the window's rounded edge.
@@ -237,7 +249,129 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw(&self, t: &ID2D1HwndRenderTarget, n: &Node) -> Result<()> {
+    /// Paint a layered window: the content `w` × `h` DIPs at `margin` from the window's edges,
+    /// clipped to its rounded rectangle (anti-aliased), over a soft shadow in the margin; then
+    /// hand the pixels to DWM with UpdateLayeredWindow.
+    pub fn paint_layered(&mut self, hwnd: HWND, dpi: f32, roots: &[Node], fields: Vec<Field>, margin: f32) -> Result<()> {
+        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
+        let mut win = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut win)? };
+        let (pw, ph) = (win.right - win.left, win.bottom - win.top);
+        if pw <= 0 || ph <= 0 {
+            return Ok(());
+        }
+        if self.layered.as_ref().is_none_or(|l| l.w != pw || l.h != ph) {
+            self.drop_layered();
+            unsafe {
+                let dc = CreateCompatibleDC(None);
+                let bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: pw, biHeight: -ph, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let dib = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+                let old = SelectObject(dc, dib.into());
+                let props = D2D1_RENDER_TARGET_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                    dpiX: dpi,
+                    dpiY: dpi,
+                    ..Default::default()
+                };
+                let target = self.d2d.CreateDCRenderTarget(&props)?;
+                target.BindDC(dc, &RECT { left: 0, top: 0, right: pw, bottom: ph })?;
+                // ClearType needs an opaque background; on alpha it fringes.
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                self.bitmaps.borrow_mut().clear();
+                *self.backdrop_bitmap.borrow_mut() = None;
+                self.layered = Some(Layered { target, dc, dib, old, w: pw, h: ph });
+            }
+        }
+        let Some(l) = &self.layered else { return Ok(()) };
+        let t: ID2D1RenderTarget = l.target.cast()?;
+        *self.fields.borrow_mut() = fields;
+        self.field_at.set(0);
+        let pick = |c: Option<(Rgba, Rgba)>| c.map(|(d, l)| if self.dark { d } else { l });
+        let size = unsafe { t.GetSize() };
+        let body = D2D_RECT_F { left: margin, top: margin, right: size.width - margin, bottom: size.height - margin };
+        let r = self.radius;
+        unsafe {
+            t.BeginDraw();
+            t.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            // The shadow: rounded rectangles growing into the margin, each fainter, offset down.
+            let steps = (margin / 2.0).floor() as i32;
+            for i in (1..=steps).rev() {
+                let d = i as f32 * 2.0;
+                let a = 0.10 * (1.0 - i as f32 / (steps as f32 + 1.0)).powi(2);
+                let b = t.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a }, None)?;
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F { left: body.left - d * 0.6, top: body.top - d * 0.4, right: body.right + d * 0.6, bottom: body.bottom + d * 0.9 },
+                    radiusX: r + d * 0.6,
+                    radiusY: r + d * 0.6,
+                };
+                t.FillRoundedRectangle(&rr, &b);
+            }
+            // Everything else inside the rounded body, anti-aliased at the corners.
+            let shape = self.d2d.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect: body, radiusX: r, radiusY: r })?;
+            let layer = t.CreateLayer(None)?;
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: D2D_RECT_F { left: f32::MIN, top: f32::MIN, right: f32::MAX, bottom: f32::MAX },
+                geometricMask: std::mem::ManuallyDrop::new(Some(shape.cast()?)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: windows_numerics::Matrix3x2::identity(),
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            t.PushLayer(&params, &layer);
+            t.SetTransform(&windows_numerics::Matrix3x2::translation(margin, margin));
+            let inner = D2D_RECT_F { left: 0.0, top: 0.0, right: body.right - body.left, bottom: body.bottom - body.top };
+            if self.backdrop.is_some() {
+                let b = t.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, None)?;
+                t.FillRectangle(&inner, &b);
+                self.draw_backdrop(&t, hwnd, dpi, margin)?;
+            }
+            for c in [pick(self.tint), pick(self.scrim)].into_iter().flatten() {
+                let b = t.CreateSolidColorBrush(&color(c), None)?;
+                t.FillRectangle(&inner, &b);
+            }
+            for n in roots {
+                self.draw(&t, n)?;
+            }
+            t.SetTransform(&windows_numerics::Matrix3x2::identity());
+            t.PopLayer();
+            if let Some(e) = pick(self.edge) {
+                let b = t.CreateSolidColorBrush(&color(e), None)?;
+                let er = D2D_RECT_F { left: body.left + 0.5, top: body.top + 0.5, right: body.right - 0.5, bottom: body.bottom - 0.5 };
+                t.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: er, radiusX: r, radiusY: r }, &b, 1.0, None);
+            }
+            if let Err(e) = t.EndDraw(None, None) {
+                if e.code() == D2DERR_RECREATE_TARGET {
+                    self.drop_layered();
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let pos = windows::Win32::Foundation::POINT { x: win.left, y: win.top };
+            let sz = windows::Win32::Foundation::SIZE { cx: pw, cy: ph };
+            let src = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+            UpdateLayeredWindow(hwnd, None, Some(&pos), Some(&sz), Some(l.dc), Some(&src), windows::Win32::Foundation::COLORREF(0), Some(&blend), ULW_ALPHA)?;
+        }
+        Ok(())
+    }
+
+    fn drop_layered(&mut self) {
+        if let Some(l) = self.layered.take() {
+            unsafe {
+                windows::Win32::Graphics::Gdi::SelectObject(l.dc, l.old);
+                let _ = DeleteObject(l.dib.into());
+                let _ = windows::Win32::Graphics::Gdi::DeleteDC(l.dc);
+            }
+        }
+    }
+
+    fn draw(&self, t: &ID2D1RenderTarget, n: &Node) -> Result<()> {
         let f = n.frame;
         unsafe {
             if let Some(bg) = props_color(&n.props, &["backgroundColor", "background"]).filter(|c| c.a > 0.0) {
@@ -346,7 +480,7 @@ impl Renderer {
 impl Renderer {
     /// A borderless text field, as tish-macos's `bezeled={false}`: the text (or placeholder) on the
     /// panel, the selection, and a caret while focused. Scrolls to keep the caret in view.
-    fn draw_field(&self, t: &ID2D1HwndRenderTarget, n: &Node, field: &Field) -> Result<()> {
+    fn draw_field(&self, t: &ID2D1RenderTarget, n: &Node, field: &Field) -> Result<()> {
         let f = n.frame;
         let (pt, pr, pb, pl) = tishlang_ms_common::layout::padding(&n.props);
         let fnt = font(&n.props);
@@ -396,7 +530,7 @@ impl Renderer {
     /// The image for `src` at about `dip` DIPs (drawn at twice that for sharp high-DPI edges):
     /// `file:<path>` is the shell's icon for a file, folder, program or shortcut;
     /// `image:<path>` an image file (PNG, ICO, JPEG, …). None when it can't be loaded.
-    fn bitmap(&self, t: &ID2D1HwndRenderTarget, src: &str, dip: f32) -> Option<ID2D1Bitmap> {
+    fn bitmap(&self, t: &ID2D1RenderTarget, src: &str, dip: f32) -> Option<ID2D1Bitmap> {
         if src.is_empty() {
             return None;
         }

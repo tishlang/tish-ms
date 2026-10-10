@@ -71,6 +71,8 @@ thread_local! {
     static DARK: Cell<bool> = const { Cell::new(true) };
     /// A `borderless` window: no frame, the client area is the whole window.
     static BORDERLESS: Cell<bool> = const { Cell::new(false) };
+    /// A layered window's transparent margin (DIPs) around its content, where its shadow is drawn.
+    static MARGIN: Cell<f64> = const { Cell::new(0.0) };
 }
 
 fn s(v: &str) -> Value {
@@ -172,7 +174,24 @@ fn client_size_dip(hwnd: HWND) -> (f64, f64) {
         let _ = GetClientRect(hwnd, &mut rc);
     }
     let sc = dpi_scale(hwnd);
-    ((rc.right - rc.left) as f64 / sc, (rc.bottom - rc.top) as f64 / sc)
+    let m = 2.0 * margin();
+    ((rc.right - rc.left) as f64 / sc - m, (rc.bottom - rc.top) as f64 / sc - m)
+}
+
+fn margin() -> f64 {
+    MARGIN.with(|m| m.get())
+}
+
+/// Whether `hwnd` draws itself with UpdateLayeredWindow.
+fn layered(hwnd: HWND) -> bool {
+    unsafe { (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0) != 0 }
+}
+
+/// A mouse message's point in content DIPs (inside a layered window's margin).
+fn mouse_dip(hwnd: HWND, lp: LPARAM) -> (f64, f64) {
+    let sc = dpi_scale(hwnd);
+    let m = margin();
+    ((lp.0 & 0xffff) as i16 as f64 / sc - m, ((lp.0 >> 16) & 0xffff) as i16 as f64 / sc - m)
 }
 
 fn relayout(app: &mut App) {
@@ -409,7 +428,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let island = false;
                     let drawn: &[Node] = if island { &[] } else { &app.roots };
                     let fields = field_states(app);
-                    let _ = app.renderer.paint(hwnd, dpi, drawn, fields);
+                    if margin() > 0.0 || layered(hwnd) {
+                        let _ = app.renderer.paint_layered(hwnd, dpi, drawn, fields, margin() as f32);
+                    } else {
+                        let _ = app.renderer.paint(hwnd, dpi, drawn, fields);
+                    }
                     app.stats.last_paint_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     if !app.painted {
                         app.painted = true;
@@ -429,12 +452,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 };
                 if let Some(app) = guard.as_mut() {
                     app.renderer.resize(w, h);
-                    // The panel's own rounded corners (DWM rounds only with a GPU, and only 8 px).
-                    let r = (app.renderer.radius as f64 * dpi_scale(hwnd) * 2.0).round() as i32;
-                    if r > 0 {
-                        let rgn = CreateRoundRectRgn(0, 0, w as i32 + 1, h as i32 + 1, r, r);
-                        let _ = SetWindowRgn(hwnd, Some(rgn), true);
-                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     relayout(app);
                     #[cfg(feature = "winui")]
                     if let Some(x) = app.xaml.as_mut() {
@@ -456,8 +474,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let sc = dpi_scale(hwnd);
-            let (x, y) = ((lp.0 & 0xffff) as i16 as f64 / sc, ((lp.0 >> 16) & 0xffff) as i16 as f64 / sc);
+            let (x, y) = mouse_dip(hwnd, lp);
             let edit = APP.with(|a| {
                 let a = a.try_borrow().ok()?;
                 let app = a.as_ref()?;
@@ -474,8 +491,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let sc = dpi_scale(hwnd);
-            let (x, y) = ((lp.0 & 0xffff) as i16 as f64 / sc, ((lp.0 >> 16) & 0xffff) as i16 as f64 / sc);
+            let (x, y) = mouse_dip(hwnd, lp);
             if let Some(f) = handler_at(x, y, "onClick") {
                 call(&f, &[obj(vec![("x", Value::Number(x)), ("y", Value::Number(y))])]);
             }
@@ -594,6 +610,11 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         if props_bool(o, &["topmost"], false) {
             ex |= WS_EX_TOPMOST;
         }
+        if borderless && own_shape {
+            // Per-pixel alpha: anti-aliased corners, and a shadow in a clear margin around it.
+            ex |= WS_EX_LAYERED;
+            MARGIN.with(|m| m.set(props_f64(o, &["shadow", "margin"], 24.0)));
+        }
         let hwnd = CreateWindowExW(
             ex,
             class,
@@ -610,12 +631,13 @@ fn create_window(o: &PropMap) -> windows::core::Result<HWND> {
         )?;
         let sc = dpi_scale(hwnd);
         let (w, h) = (props_f64(o, &["width"], 640.0), props_f64(o, &["height"], 420.0));
-        let (pw, ph) = ((w * sc) as i32, (h * sc) as i32);
+        let mp = (margin() * sc).round() as i32;
+        let (pw, ph) = ((w * sc) as i32 + 2 * mp, (h * sc) as i32 + 2 * mp);
         // Centred across, a fifth of the way down the screen's usable area (as the Mac panel's top
         // edge at 80% of the screen's height), leaving room to grow.
         let work = work_area(hwnd);
         let (ww, wh) = (work.right - work.left, work.bottom - work.top);
-        let _ = SetWindowPos(hwnd, None, work.left + (ww - pw) / 2, work.top + wh / 5, pw, ph, SWP_NOZORDER | SWP_FRAMECHANGED);
+        let _ = SetWindowPos(hwnd, None, work.left + (ww - pw) / 2, work.top + wh / 5 - mp, pw, ph, SWP_NOZORDER | SWP_FRAMECHANGED);
         let (fw, fh) = frame_extra(hwnd);
         if fw != 0 || fh != 0 {
             let _ = SetWindowPos(hwnd, None, 0, 0, pw + fw, ph + fh, SWP_NOZORDER | SWP_NOMOVE);
@@ -686,6 +708,8 @@ fn show(hwnd: HWND) {
     }
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // A layered window shows nothing until it hands DWM a frame.
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
         let _ = SetForegroundWindow(hwnd);
         if let Some(e) = APP.with(|a| a.borrow().as_ref().and_then(|a| a.edits.first().map(|e| e.hwnd))) {
             let _ = SetFocus(Some(e));
@@ -933,14 +957,16 @@ fn win_set_size(args: &[Value]) -> Value {
     let num = |i: usize| args.get(i).and_then(|v| v.as_number()).unwrap_or(0.0);
     let sc = dpi_scale(h);
     let (fw, fh) = frame_extra(h);
-    let (w, ht) = ((num(0) * sc) as i32 + fw, (num(1) * sc) as i32 + fh);
+    let mp = (margin() * sc).round() as i32;
+    let (w, ht) = ((num(0) * sc) as i32 + fw + 2 * mp, (num(1) * sc) as i32 + fh + 2 * mp);
     unsafe {
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
         let cx = (r.left + r.right) / 2;
         // Grow down from the same top edge, but never under the taskbar.
         let work = work_area(h);
-        let top = r.top.min(work.bottom - ht).max(work.top);
+        // The content, not the shadow margin, stays inside the work area.
+        let top = r.top.min(work.bottom - ht + mp).max(work.top - mp);
         let _ = SetWindowPos(h, None, cx - w / 2, top, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     Value::Null
